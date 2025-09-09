@@ -1,3 +1,6 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 import dataclasses
 
 import jax
@@ -178,11 +181,13 @@ obj_idx = jnp.arange(max_num_objects)
 #     control_array=control_sequence,
 # )
 
+# leading vehicle control
 actor_0 = agents.create_constant_acceleration_actor(
     dynamics_model=dynamics_model,
     is_controlled_func=lambda state: obj_idx == leading_index,
     acceleration=-6
 )
+
 # IDM actor/policy controlling both object 0 and 1.
 # Note IDM policy is an actor hard-coded to use dynamics.StateDynamics().
 # actor_1 = agents.IDMRoutePolicy(
@@ -196,13 +201,13 @@ actor_1 = agents.davis_actor(
     lead_idx=leading_index,
 )
 
-# Exper/log actor controlling objects 3 and 4.
+# controls all the other vehicles.
 actor_2 = agents.create_expert_actor(
     dynamics_model=dynamics_model,
     is_controlled_func=lambda state: (obj_idx != leading_index) & (obj_idx != av_index),
 )
 
-actors = [actor_0, actor_1, actor_2]
+actors = [actor_0, actor_1, actor_2]  # include all the vehicles you want to change
 jit_step = jax.jit(env.step)
 jit_select_action_list = [jax.jit(actor.select_action) for actor in actors]
 states = [env.reset(scenario)]
@@ -233,25 +238,25 @@ for _ in range(t, T):
 
   action = agents.merge_actions(outputs)
   next_state = jit_step(clean_state, action)
+  if next_state.timestep < 45:
 
-  states.append(next_state)
+    states.append(next_state)
 
-  # tensor[0, 0, _] = next_state.sim_trajectory.x[av_index, _]
-  # tensor[0, 1, _] = next_state.sim_trajectory.y[av_index, _]
-  # tensor[0, 2, _] = next_state.sim_trajectory.vel_x[av_index, _]
-  # tensor[0, 3, _] = next_state.sim_trajectory.vel_y[av_index, _]
-  #
-  # tensor[1, 0, _] = next_state.sim_trajectory.x[leading_index, _]
-  # tensor[1, 1, _] = next_state.sim_trajectory.y[leading_index, _]
-  # tensor[1, 2, _] = next_state.sim_trajectory.vel_x[leading_index, _]
-  # tensor[1, 3, _] = next_state.sim_trajectory.vel_y[leading_index, _]
-
-  imgs = []
-  for state in states:
-      imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-  with imageio.get_writer(f'../processed_data/{scenario_id}_m.mp4', fps=10) as writer:
-      for frame in imgs:
-          writer.append_data(frame)
+    # tensor[0, 0, _] = next_state.sim_trajectory.x[av_index, _]
+    # tensor[0, 1, _] = next_state.sim_trajectory.y[av_index, _]
+    # tensor[0, 2, _] = next_state.sim_trajectory.vel_x[av_index, _]
+    # tensor[0, 3, _] = next_state.sim_trajectory.vel_y[av_index, _]
+    #
+    # tensor[1, 0, _] = next_state.sim_trajectory.x[leading_index, _]
+    # tensor[1, 1, _] = next_state.sim_trajectory.y[leading_index, _]
+    # tensor[1, 2, _] = next_state.sim_trajectory.vel_x[leading_index, _]
+    # tensor[1, 3, _] = next_state.sim_trajectory.vel_y[leading_index, _]
+    imgs = []
+    for state in states:
+        imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
+    with imageio.get_writer(f'docs/processed_data/{scenario_id}_m3.mp4', fps=10) as writer:
+        for frame in imgs:
+            writer.append_data(frame)
 
 # with open(f"../processed_data/{scenario_id}_m.pkl", "wb") as f:
 #     pickle.dump(tensor, f)

@@ -3,7 +3,7 @@ import jax
 import jax.numpy as jnp
 from waymax import datatypes, dynamics
 from waymax.agents import actor_core
-
+import numpy as np
 
 def davis_actor(
         dynamics_model: dynamics.DynamicsModel,
@@ -18,10 +18,14 @@ def davis_actor(
 
         y = jnp.where(
             cond,
-            speedF * headway - r * speedF - (speedF ** 2) / (2 * accF + 1e-6),
+            speedF * headway - r * speedF + (speedF ** 2) / (2 * accF + 1e-6),
             speedF * headway + (speedL ** 2) / (2 * accL + 1e-6)
-            - r * speedF - (speedF ** 2) / (2 * accF + 1e-6),
+            - r * speedF + (speedF ** 2) / (2 * accF + 1e-6),
         )
+        return y
+    
+    def y_func_2(speedL, speedF, accF, posL, posF):
+        y = -(speedF**2) /((2 * accF + 1e-6)) + speedL*0.1 + jnp.linalg.norm(posL - posF)
         return y
 
     def select_action(
@@ -69,7 +73,9 @@ def davis_actor(
         speedL_prev = jnp.linalg.norm(velL_prev)
 
         jax.debug.print("velF_t0={}", velF_t0)
+        jax.debug.print("speedF_t0={}", speedF_t0)
         jax.debug.print("velL_t0={}", velL_t0)
+        jax.debug.print("speedL_t0={}", speedL_t0)
         jax.debug.print("velF_prev={}", velF_prev)
         jax.debug.print("velL_prev={}", velL_prev)
 
@@ -81,43 +87,77 @@ def davis_actor(
         jax.debug.print("accL={}", accL)
 
         # ========== 计算 headway ==========
-        headway = jnp.linalg.norm(posL_t0 - posF_t0)
-
+        headway = jnp.linalg.norm(posL_t0 - posF_t0)/speedF_t0
+        jax.debug.print("h={}", headway)
         # ========== 调整 accF_try ==========
-        y_val = y_func(speedL_t0, accL, speedF_t0, headway, accF)
+        # y_val = y_func(speedL_t0, accL, speedF_t0, headway, accF)
+        # jax.debug.print("y_val={}", y_val)
 
-        def adjust_acc_if_negative(_):
-            """当 y_val < 0 时，调整 accF_try."""
-            # 如果 accF > 0，就先设为 0
-            # accF_init = jnp.where(accF > 0, 0.0, accF)
-            y_init = y_func(speedL_t0, accL, speedF_t0, headway, accF)
+        # def adjust_acc_if_negative(_):
+        #     """当 y_val < 0 时，调整 accF_try."""
+        #     # 如果 accF > 0，就先设为 0
+        #     # accF_init = jnp.where(accF > 0, 0.0, accF)
+        #     y_init = y_func(speedL_t0, accL, speedF_t0, headway, accF)
 
-            def cond_fun(val):
-                y_new, acc_try, iter = val
-                jax.debug.print("y_new:{}", y_new)
-                jax.debug.print("acc_try:{}", acc_try)
-                return (y_new < 0) & (iter < 1000)
+        #     def cond_fun(val):
+        #         y_new, acc_try, iter = val
+        #         jax.debug.print("y_new:{}", y_new)
+        #         jax.debug.print("acc_try:{}", acc_try)
+        #         return (y_new < 0) & (iter < 1000)
 
-            def body_fun(val):
-                y_new, acc_try, iter = val
+        #     def body_fun(val):
+        #         y_new, acc_try, iter = val
 
-                acc_try = acc_try - 1
-                jax.debug.print("y_new:{}",y_new)
-                jax.debug.print("acc_try:{}",acc_try)
+        #         acc_try = acc_try - 1
+        #         jax.debug.print("y_new:{}",y_new)
+        #         jax.debug.print("acc_try:{}",acc_try)
 
-                y_new = y_func(speedL_t0, accL, speedF_t0, headway, acc_try)
-                iter += 1
-                return y_new, acc_try, iter
+        #         y_new = y_func(speedL_t0, accL, speedF_t0, headway, acc_try)
+        #         iter += 1
+        #         return y_new, acc_try, iter
 
-            y_new, accF_try, _ = jax.lax.while_loop(cond_fun, body_fun, (y_init, accF, 0))
-            return accF_try
+        #     y_new, accF_try, _ = jax.lax.while_loop(cond_fun, body_fun, (y_init, accF, 0))
+        #     return accF_try
 
-        def keep_acc_if_positive(_):
-            """当 y_val >= 0 时，保持原 accF."""
-            return accF
+        # def keep_acc_if_positive(_):
+        #     """当 y_val >= 0 时，保持原 accF."""
+        #     return accF
 
-        # 如果 y_val < 0 就调用 adjust_acc_if_negative，否则保持 accF
-        accF_try = jax.lax.cond(y_val < 0, adjust_acc_if_negative, keep_acc_if_positive, operand=None)
+        # # 如果 y_val < 0 就调用 adjust_acc_if_negative，否则保持 accF
+        # accF_try = jax.lax.cond(y_val < 0, adjust_acc_if_negative, keep_acc_if_positive, operand=None)
+        
+        # --- Parameters to tune ---
+        NUM_CANDIDATES = 41          # resolution of search
+        MAX_BRAKE = 4              # strongest braking (m/s^2)
+        MAX_ACCEL = 2.0              # strongest comfortable acceleration (m/s^2)
+        EPS = 1e-6
+
+        # Build candidate accelerations
+        candidates = jnp.linspace(MAX_ACCEL, -MAX_BRAKE, NUM_CANDIDATES)
+
+        # Evaluate y_func for each candidate (counterfactual search)
+        #y_vals = jax.vmap(lambda a: y_func(speedL_t0, accL, speedF_t0, headway, a))(candidates)
+        y_vals = jax.vmap(lambda a: y_func_2(speedL_t0, speedF_t0, accF, posL_t0, posF_t0))(candidates)
+    
+        # Mask of safe accelerations
+        safe_mask = y_vals >= 0.0
+        any_safe = jnp.any(safe_mask)
+        
+        jax.debug.print("y vals={}", y_vals)
+        
+        # Choose least intrusive safe acceleration
+        def choose_safe():
+            safe_indices = jnp.nonzero(safe_mask, size=NUM_CANDIDATES)[0]
+            safe_candidates = candidates[safe_indices]
+            diffs = jnp.abs(safe_candidates - accF)
+            idx = jnp.argmin(diffs)
+            return jnp.asarray(safe_candidates[idx])
+
+        # Fallback: strongest brake if nothing is safe
+        def choose_emergency():
+            return jnp.asarray(-MAX_BRAKE)
+
+        accF_try = jax.lax.cond(any_safe, choose_safe, choose_emergency)
 
         jax.debug.print("Suggested accF_try={}", accF_try)
 
