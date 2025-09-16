@@ -25,8 +25,13 @@ def davis_actor(
         return y
     
     def y_func_2(speedL, speedF, accF, posL, posF):
-        y = -(speedF**2) /((2 * accF + 1e-6)) + speedL*0.1 + jnp.linalg.norm(posL - posF)
+        y = -(speedF**2) /((2 * jnp.abs(accF) + 1e-6)) + speedL*0.1 + jnp.linalg.norm(posL - posF)
         return y
+    
+    def actor_init(rng, init_state):
+        # reaction_timer tracks remaining steps before AV reacts
+        return {"reaction_timer": jnp.array(0, dtype=jnp.int32),
+                "has_reacted": jnp.array(False)}
 
     def select_action(
             params: actor_core.Params,
@@ -34,7 +39,7 @@ def davis_actor(
             actor_state=None,
             rng: jax.Array = None,
     ) -> actor_core.WaymaxActorOutput:
-        del params, actor_state, rng
+        #del params, actor_state, rng
 
         is_controlled = is_controlled_func(state)
 
@@ -42,7 +47,8 @@ def davis_actor(
         traj_t0 = datatypes.dynamic_index(
             state.sim_trajectory, state.timestep, axis=-1, keepdims=True
         )
-        jax.debug.print("Timestep={}",state.timestep)
+        #jax.debug.print("timestep={}, actor_state_in={}", state.timestep, actor_state)
+
 
         def get_prev(_):
             return datatypes.dynamic_index(state.sim_trajectory, state.timestep - 1, axis=-1, keepdims=True)
@@ -72,94 +78,107 @@ def davis_actor(
         speedL_t0 = jnp.linalg.norm(velL_t0)
         speedL_prev = jnp.linalg.norm(velL_prev)
 
-        jax.debug.print("velF_t0={}", velF_t0)
-        jax.debug.print("speedF_t0={}", speedF_t0)
-        jax.debug.print("velL_t0={}", velL_t0)
-        jax.debug.print("speedL_t0={}", speedL_t0)
-        jax.debug.print("velF_prev={}", velF_prev)
-        jax.debug.print("velL_prev={}", velL_prev)
+        #jax.debug.print("velF_t0={}", velF_t0)
+        #jax.debug.print("speedF_t0={}", speedF_t0)
+        #jax.debug.print("velL_t0={}", velL_t0)
+        #jax.debug.print("speedL_t0={}", speedL_t0)
+        #jax.debug.print("velF_prev={}", velF_prev)
+        #jax.debug.print("velL_prev={}", velL_prev)
 
         # ========== 计算加速度 ==========
         accF = (speedF_t0 - speedF_prev) / datatypes.TIME_INTERVAL
         accL = (speedL_t0 - speedL_prev) / datatypes.TIME_INTERVAL
 
-        jax.debug.print("accF={}", accF)
-        jax.debug.print("accL={}", accL)
+        #jax.debug.print("accF={}", accF)
+        #jax.debug.print("accL={}", accL)
 
         # ========== 计算 headway ==========
-        headway = jnp.linalg.norm(posL_t0 - posF_t0)/speedF_t0
-        jax.debug.print("h={}", headway)
+        headway = jnp.linalg.norm(posL_t0 - posF_t0)
+        #jax.debug.print("h={}", headway)
         # ========== 调整 accF_try ==========
-        # y_val = y_func(speedL_t0, accL, speedF_t0, headway, accF)
-        # jax.debug.print("y_val={}", y_val)
 
-        # def adjust_acc_if_negative(_):
-        #     """当 y_val < 0 时，调整 accF_try."""
-        #     # 如果 accF > 0，就先设为 0
-        #     # accF_init = jnp.where(accF > 0, 0.0, accF)
-        #     y_init = y_func(speedL_t0, accL, speedF_t0, headway, accF)
+        if actor_state is None:
+            # initialize reaction timer
+            actor_state = {"reaction_timer": 0,
+                           "has_reacted": jnp.array(False)}
+        #jax.debug.print("actor_state={}", actor_state)
 
-        #     def cond_fun(val):
-        #         y_new, acc_try, iter = val
-        #         jax.debug.print("y_new:{}", y_new)
-        #         jax.debug.print("acc_try:{}", acc_try)
-        #         return (y_new < 0) & (iter < 1000)
+        # Detect sudden leader braking
+        SUDDEN_BRAKE_THRESHOLD = -2.0  # m/s^2
+        REACTION_STEPS = int(0.5 / datatypes.TIME_INTERVAL)
 
-        #     def body_fun(val):
-        #         y_new, acc_try, iter = val
+        # Step 1: read previous timer
+        reaction_timer = actor_state["reaction_timer"]
+        has_reacted = actor_state["has_reacted"]
 
-        #         acc_try = acc_try - 1
-        #         jax.debug.print("y_new:{}",y_new)
-        #         jax.debug.print("acc_try:{}",acc_try)
-
-        #         y_new = y_func(speedL_t0, accL, speedF_t0, headway, acc_try)
-        #         iter += 1
-        #         return y_new, acc_try, iter
-
-        #     y_new, accF_try, _ = jax.lax.while_loop(cond_fun, body_fun, (y_init, accF, 0))
-        #     return accF_try
-
-        # def keep_acc_if_positive(_):
-        #     """当 y_val >= 0 时，保持原 accF."""
-        #     return accF
-
-        # # 如果 y_val < 0 就调用 adjust_acc_if_negative，否则保持 accF
-        # accF_try = jax.lax.cond(y_val < 0, adjust_acc_if_negative, keep_acc_if_positive, operand=None)
+        #jax.debug.print("reaction timer: {}", reaction_timer)
+        # Step 2: detect trigger only when not already reacting
+        leader_sudden_brake = accL < jnp.asarray(SUDDEN_BRAKE_THRESHOLD, dtype=accL.dtype)
+        start_reaction = (~has_reacted) & (reaction_timer == 0) & leader_sudden_brake
+        #start_reaction = (reaction_timer == 0) & (accL < SUDDEN_BRAKE_THRESHOLD)
+        #reaction_timer = jnp.where(start_reaction, REACTION_STEPS, reaction_timer)
+        reaction_timer = jnp.where(
+            start_reaction,
+            jnp.array(REACTION_STEPS, dtype=jnp.int32),
+            jnp.where(reaction_timer > 0, reaction_timer - 1, jnp.array(0, dtype=jnp.int32)),
+        )
+        has_reacted = jnp.where(start_reaction, True, has_reacted)
         
-        # --- Parameters to tune ---
-        NUM_CANDIDATES = 41          # resolution of search
-        MAX_BRAKE = 4              # strongest braking (m/s^2)
-        MAX_ACCEL = 2.0              # strongest comfortable acceleration (m/s^2)
-        EPS = 1e-6
+        #jax.debug.print("accL: {}, start_reaction: {}, timer: {}", accL, start_reaction, reaction_timer)
 
-        # Build candidate accelerations
-        candidates = jnp.linspace(MAX_ACCEL, -MAX_BRAKE, NUM_CANDIDATES)
+        # Update actor_state
+        new_actor_state = {**actor_state, 
+                           "reaction_timer": reaction_timer,
+                           "has_reacted": has_reacted}
 
-        # Evaluate y_func for each candidate (counterfactual search)
-        #y_vals = jax.vmap(lambda a: y_func(speedL_t0, accL, speedF_t0, headway, a))(candidates)
-        y_vals = jax.vmap(lambda a: y_func_2(speedL_t0, speedF_t0, accF, posL_t0, posF_t0))(candidates)
-    
-        # Mask of safe accelerations
-        safe_mask = y_vals >= 0.0
-        any_safe = jnp.any(safe_mask)
+
+        def during_reaction(_):
+            return accF
         
-        jax.debug.print("y vals={}", y_vals)
+        def after_reaction(_):
+            # --- Parameters to tune ---
+            NUM_CANDIDATES = 41          # resolution of search
+            MAX_BRAKE = 3.50              # strongest braking (m/s^2)
+            MAX_ACCEL = 2.0              # strongest comfortable acceleration (m/s^2)
+            EPS = 1e-6
+
+            # Build candidate accelerations
+            candidates = jnp.linspace(MAX_ACCEL, -MAX_BRAKE, NUM_CANDIDATES)
+
+            # Evaluate y_func for each candidate (counterfactual search)
+            #y_vals = jax.vmap(lambda a: y_func(speedL_t0, accL, speedF_t0, headway, a))(candidates)
+            y_vals = jax.vmap(lambda a: y_func_2(speedL_t0, speedF_t0, accF, posL_t0, posF_t0))(candidates)
         
-        # Choose least intrusive safe acceleration
-        def choose_safe():
-            safe_indices = jnp.nonzero(safe_mask, size=NUM_CANDIDATES)[0]
-            safe_candidates = candidates[safe_indices]
-            diffs = jnp.abs(safe_candidates - accF)
-            idx = jnp.argmin(diffs)
-            return jnp.asarray(safe_candidates[idx])
+            # Mask of safe accelerations
+            safe_mask = y_vals >= 0.0
+            any_safe = jnp.any(safe_mask)
+            
+            #jax.debug.print("y vals={} and any_safe={}", y_vals, any_safe)
+            
+            # Choose least intrusive safe acceleration
+            def choose_safe():
+                safe_indices = jnp.nonzero(safe_mask, size=NUM_CANDIDATES)[0]
+                safe_candidates = candidates[safe_indices]
+                diffs = jnp.abs(safe_candidates - accF)
+                idx = jnp.argmin(diffs)
+                return jnp.asarray(safe_candidates[idx])
 
-        # Fallback: strongest brake if nothing is safe
-        def choose_emergency():
-            return jnp.asarray(-MAX_BRAKE)
+            # Fallback: strongest brake if nothing is safe
+            def choose_emergency():
+                return jnp.asarray(-MAX_BRAKE)
 
-        accF_try = jax.lax.cond(any_safe, choose_safe, choose_emergency)
+            accF_try = jax.lax.cond(any_safe, choose_safe, choose_emergency)
+        
+            # Optional: limit jerk
+            MAX_JERK = 6.0
+            max_delta = MAX_JERK * datatypes.TIME_INTERVAL
+            accF_try = jnp.clip(accF_try, accF_try - max_delta, accF_try + max_delta)
 
-        jax.debug.print("Suggested accF_try={}", accF_try)
+            return accF_try
+        
+        accF_try = jax.lax.cond(reaction_timer > 0, during_reaction, after_reaction, operand=None)
+
+        #jax.debug.print("Suggested accF_try={}", accF_try)
 
         # ========== 更新 AV 的速度 ==========
         directionF = jnp.where(speedF_t0 > 1e-3, velF_t0 / speedF_t0, jnp.zeros_like(velF_t0))
@@ -183,13 +202,14 @@ def davis_actor(
         actions = dynamics_model.inverse(traj_combined, state.object_metadata, timestep=0)
 
         return actor_core.WaymaxActorOutput(
-            actor_state=None,
+            actor_state=new_actor_state,
             action=actions,
             is_controlled=is_controlled,
         )
 
     return actor_core.actor_core_factory(
-        init=lambda rng, init_state: None,
+        #init=lambda rng, init_state: {"reaction_timer": jnp.array(0, dtype=jnp.int32)},
+        init=actor_init,
         select_action=select_action,
         name="davis_actor"
     )

@@ -122,6 +122,63 @@ def strip_scenario_id(state):
     )
     return dataclasses.replace(state, object_metadata=clean_metadata)
 
+
+def detect_collision(trajectory, av_idx, lead_idx):
+    """
+    Returns:
+        collision_happened (bool),
+        first_collision_timestep (int or None),
+        speed_av_at_collision (float or None),
+        speed_lead_at_collision (float or None),
+        delta_v (float or None)
+    """
+    # Extract positions across timesteps
+    x_av, y_av = trajectory.x[av_idx], trajectory.y[av_idx]
+    x_lead, y_lead = trajectory.x[lead_idx], trajectory.y[lead_idx]
+    vx_av = trajectory.vel_x[av_index]
+    vy_av = trajectory.vel_y[av_index]
+    v_av = np.stack([vx_av, vy_av], axis=-1)
+    # Euclidean distance
+    # dist = jnp.sqrt((x_av - x_lead)**2 + (y_av - y_lead)**2)
+    p_av = np.stack([x_av, y_av], axis=-1)
+    p_obj = np.stack([x_lead, y_lead], axis=-1)
+
+    v_av_norm = v_av / (np.linalg.norm(v_av, axis=1, keepdims=True) + 1e-6)
+    diff = p_obj - p_av
+    proj = np.einsum('ij,ij->i', diff, v_av_norm)
+
+    jax.debug.print('proj:{}', proj[:50])
+    # Collision threshold
+    collision_mask = proj < 0
+
+    collision_happened = bool(jnp.any(collision_mask))
+    first_collision_timestep = None
+    speed_av_at_collision = None
+    speed_lead_at_collision = None
+    delta_v = None
+
+    if collision_happened:
+        # timestep of first collision
+        first_collision_timestep = int(jnp.argmax(collision_mask))
+
+        # Speeds at collision timestep
+        vx_av = trajectory.vel_x[av_idx, first_collision_timestep]
+        vy_av = trajectory.vel_y[av_idx, first_collision_timestep]
+        vx_lead = trajectory.vel_x[lead_idx, first_collision_timestep]
+        vy_lead = trajectory.vel_y[lead_idx, first_collision_timestep]
+
+        speed_av_at_collision = float(jnp.sqrt(vx_av**2 + vy_av**2))
+        speed_lead_at_collision = float(jnp.sqrt(vx_lead**2 + vy_lead**2))
+        delta_v = abs(speed_av_at_collision - speed_lead_at_collision)
+
+    return (
+        collision_happened,
+        first_collision_timestep,
+        speed_av_at_collision,
+        speed_lead_at_collision,
+        delta_v,
+    )
+
 # Config dataset:
 max_num_objects = 32
 
@@ -132,7 +189,9 @@ data_iter = dataloader.simulator_state_generator(config=config)
 
 for scenario_idx, scenario in enumerate(data_iter):
     scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
-    if scenario_id == '1fb44c31801c956d':
+    #if scenario_id == '1fb44c31801c956d':
+    #if scenario_id == 'cd7a6be74ecc125a':
+    if scenario_id == '947baabccbbe1580':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         leading_vehicles = find_leading_vehicles(scenario)
@@ -190,9 +249,16 @@ actor_0 = agents.create_constant_acceleration_actor(
 
 # IDM actor/policy controlling both object 0 and 1.
 # Note IDM policy is an actor hard-coded to use dynamics.StateDynamics().
-# actor_1 = agents.IDMRoutePolicy(
-#     is_controlled_func=lambda state: (obj_idx == 0) | (obj_idx == 1)
-# )
+#actor_1 = agents.IDMRoutePolicy(
+#    is_controlled_func=lambda state: obj_idx == av_index
+#)
+
+#actor_1 = agents.MPC_actor(
+#    dynamics_model=dynamics_model,
+#    is_controlled_func=lambda state: obj_idx == av_index,
+#    av_idx=av_index,
+#    lead_idx=leading_index,
+#)
 
 actor_1 = agents.davis_actor(
     dynamics_model=dynamics_model,
@@ -226,19 +292,32 @@ t = T - states[0].remaining_timesteps
 # tensor[1, 2, :t] = scenario.log_trajectory.vel_x[leading_index, :t]
 # tensor[1, 3, :t] = scenario.log_trajectory.vel_y[leading_index, :t]
 
+
+# create a single random key
+rng = jax.random.PRNGKey(0)
+
+actor_states = [actor.init(rng, None) for actor in actors]
+
+trajectories = [states[0]] 
+
 for _ in range(t, T):
   current_state = states[-1]
 
   clean_state = strip_scenario_id(current_state)
+  outputs = []
+  new_actor_states = []
+  
+  for i, jit_select_action in enumerate(jit_select_action_list):
+    out = jit_select_action({}, clean_state, actor_states[i], None)
+    outputs.append(out)
+    new_actor_states.append(out.actor_state)
 
-  outputs = [
-      jit_select_action({}, clean_state, None, None)
-      for jit_select_action in jit_select_action_list
-  ]
-
+  actor_states = new_actor_states
   action = agents.merge_actions(outputs)
   next_state = jit_step(clean_state, action)
-  if next_state.timestep < 45:
+  trajectories.append(next_state)
+
+  if next_state.timestep < 50:
 
     states.append(next_state)
 
@@ -254,9 +333,16 @@ for _ in range(t, T):
     imgs = []
     for state in states:
         imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-    with imageio.get_writer(f'docs/processed_data/{scenario_id}_m3.mp4', fps=10) as writer:
+    with imageio.get_writer(f'docs/processed_data/{scenario_id}_davis.mp4', fps=10) as writer:
         for frame in imgs:
             writer.append_data(frame)
+
+collision, t_col, v_av, v_lead, delta_v = detect_collision(
+                states[-1].sim_trajectory,
+                av_idx=av_index,
+                lead_idx=leading_index,
+            )
+print(f'collision: {collision}')
 
 # with open(f"../processed_data/{scenario_id}_m.pkl", "wb") as f:
 #     pickle.dump(tensor, f)

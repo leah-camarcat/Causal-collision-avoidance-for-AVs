@@ -59,7 +59,7 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
         vx_av = scenario.log_trajectory.vel_x[av_index, :T]
         vy_av = scenario.log_trajectory.vel_y[av_index, :T]
         v_av = np.stack([vx_av, vy_av], axis=-1)
-        p_av = np.stack([x_av, y_av], axis=-1)
+        p_av = np.stack([x_av, y_av], axis=-1) +2
         v_av_norm = v_av / (np.linalg.norm(v_av, axis=1, keepdims=True) + 1e-6)
 
         for i in other_vehicle_indices:

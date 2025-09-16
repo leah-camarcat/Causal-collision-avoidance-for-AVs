@@ -190,6 +190,7 @@ for scenario_idx, scenario in enumerate(data_iter):
     #if scenario_id == '1fb44c31801c956d':
     if scenario_id == '5130b590379b4722':
         # if scenario_id == '5a70fde6044f2ab4':
+        #if scenario_id == 'cd7a6be74ecc125a':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         jax.debug.print('av index:{}', av_index)
@@ -232,17 +233,17 @@ actor_0 = agents.create_lane_change_actor(
 
 # IDM actor/policy controlling both object 0 and 1.
 # Note IDM policy is an actor hard-coded to use dynamics.StateDynamics().
-actor_1 = agents.IDMRoutePolicy(
+#actor_1 = agents.IDMRoutePolicy(
     #is_controlled_func=lambda state: (obj_idx == 0) | (obj_idx == 1)
-    is_controlled_func=lambda state: obj_idx == av_index
-)
-
-#actor_1 = agents.davis_actor(
-#    dynamics_model=dynamics_model,
-#    is_controlled_func=lambda state: obj_idx == av_index,
-#    av_idx=av_index,
-#    lead_idx=leading_index,
+#    is_controlled_func=lambda state: obj_idx == av_index
 #)
+
+actor_1 = agents.causal_ellipse_actor(
+    dynamics_model=dynamics_model,
+    is_controlled_func=lambda state: obj_idx == av_index,
+    av_idx=av_index,
+    neigh_idx=leading_index,
+)
 
 
 actors = [actor_0, actor_1]  # include all the vehicles you want to change
@@ -254,7 +255,6 @@ T = max(91, states[0].remaining_timesteps)
 # tensor = np.zeros((2, 4, T), dtype=np.float32)
 
 t = T - states[0].remaining_timesteps
-
 
 rng = jax.random.PRNGKey(0)
 
@@ -288,6 +288,33 @@ for _ in range(t, T):
                 writer.append_data(frame)
     else:
         break
+  current_state = states[-1]
+
+  clean_state = strip_scenario_id(current_state)
+  outputs = []
+  new_actor_states = []
+  
+  for i, jit_select_action in enumerate(jit_select_action_list):
+    out = jit_select_action({}, clean_state, actor_states[i], None)
+    outputs.append(out)
+    new_actor_states.append(out.actor_state)
+
+  actor_states = new_actor_states
+  action = agents.merge_actions(outputs)
+  next_state = jit_step(clean_state, action)
+
+  if next_state.timestep < 55:
+
+    states.append(next_state)
+
+    imgs = []
+    for state in states:
+        imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
+    with imageio.get_writer(f'docs/processed_data/{scenario_id}_ellipse_lanechange.mp4', fps=10) as writer:
+        for frame in imgs:
+            writer.append_data(frame)
+  else:
+      break
 
 # with open(f"../processed_data/{scenario_id}_m.pkl", "wb") as f:
 #     pickle.dump(tensor, f)
