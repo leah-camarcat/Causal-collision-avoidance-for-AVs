@@ -100,6 +100,7 @@ def strip_scenario_id(state):
     )
     return dataclasses.replace(state, object_metadata=clean_metadata)
 
+
 def detect_collision(trajectory, av_idx, lead_idx):
     """
     Returns:
@@ -126,7 +127,7 @@ def detect_collision(trajectory, av_idx, lead_idx):
 
     jax.debug.print('proj:{}', proj[:45].min())
     # Collision threshold
-    collision_mask = proj < 0
+    collision_mask = (proj < 2) & (proj != 0)
 
     collision_happened = bool(jnp.any(collision_mask))
     first_collision_timestep = None
@@ -191,7 +192,7 @@ def compute_jerk(log_trajectory, veh_idx, dt=0.1):
 # Config dataset:
 max_num_objects = 32
 
-tfrecord_files = tf.io.gfile.glob("data/motion_v_1_3_0/uncompressed/tf_example/training/training_tfexample.tfrecord-*")
+tfrecord_files = tf.io.gfile.glob("data/motion_v_1_3_0/uncompressed/tf_example/training2/training_tfexample.tfrecord-*")
 filtered_scenarios = [f[:-4] for f in os.listdir("docs/filtered_data") if f.endswith('.pkl')]
 
 KPIS = pd.DataFrame(index=filtered_scenarios, columns=["col_outcome", "Vs_av", "Vs_lead", "delta_Vs", "jerk_av", "max_jerk_av", "mean_jerk_av"])
@@ -218,7 +219,8 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
         scenario = next(islice(data_iter, scenario_idx, scenario_idx+1))
         scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
         #jax.debug.print("Scenario id: {}", scenario_id)
-        if (scenario_id in filtered_scenarios) and (KPIS.loc[scenario_id].isna().all()):
+        if scenario_id == 'dddbf8db0b149f17':
+        #if (scenario_id in filtered_scenarios) and (KPIS.loc[scenario_id].isna().all()):
             jax.debug.print("Scenario id found: {}", scenario_id)
             is_sdc_mask = scenario.object_metadata.is_sdc
             av_index = np.where(is_sdc_mask)[0][0]
@@ -280,28 +282,42 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
 
             t = T - states[0].remaining_timesteps
 
+            rng = jax.random.PRNGKey(0)
+
+            actor_states = [actor.init(rng, None) for actor in actors]
+
+            trajectories = [states[0]] 
             
             for _ in range(t, T):
                 current_state = states[-1]
 
                 clean_state = strip_scenario_id(current_state)
+                outputs = []
+                new_actor_states = []
 
-                outputs = [
-                    jit_select_action({}, clean_state, None, None)
-                    for jit_select_action in jit_select_action_list
-                ]
-
+                #outputs = [
+                #    jit_select_action({}, clean_state, None, None)
+                #    for jit_select_action in jit_select_action_list
+                #]
+                for i, jit_select_action in enumerate(jit_select_action_list):
+                    out = jit_select_action({}, clean_state, actor_states[i], None)
+                    outputs.append(out)
+                    new_actor_states.append(out.actor_state)
+                
+                actor_states = new_actor_states
                 action = agents.merge_actions(outputs)
                 next_state = jit_step(clean_state, action)
-                if next_state.timestep < 45:
+                trajectories.append(next_state)
+
+                if next_state.timestep < 55:
                     states.append(next_state)
                 
-                    #imgs = []
-                    #for state in states:
-                    #    imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-                    #with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_longtest.mp4', fps=10) as writer:
-                    #    for frame in imgs:
-                    #        writer.append_data(frame)
+                    imgs = []
+                    for state in states:
+                        imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
+                    with imageio.get_writer(f'docs/processed_data/{scenario_id}_davis_test.mp4', fps=10) as writer:
+                        for frame in imgs:
+                            writer.append_data(frame)
                 
             # calculate KPIs and store them !
             # check whether collision occured
