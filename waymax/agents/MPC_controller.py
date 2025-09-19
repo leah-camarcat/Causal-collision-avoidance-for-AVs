@@ -17,12 +17,14 @@ def MPC_actor(
     """MPC Actor (longitudinal only) using Waymax dynamic_index format."""
     
     def actor_init(rng, init_state):
-        return {}  # no internal state for simple MPC
+        return {"reaction_timer": jnp.array(0, dtype=jnp.int32),
+                "has_reacted": jnp.array(False)}
 
     def select_action(params, 
                       state: datatypes.SimulatorState, 
                       actor_state=None, 
-                      rng=None):
+                      rng=None
+    ) -> actor_core.WaymaxActorOutput:
         # --- 1. Extract current AV + lead state ---
         is_controlled = is_controlled_func(state)
         
@@ -64,10 +66,13 @@ def MPC_actor(
         speed_av_prev = jnp.linalg.norm(vel_av_prev)
         acc_av = (speed_av_t0 - speed_av_prev) / 0.1
 
-        posL_t0 = jnp.array([traj_t0.x[lead_idx, 0], traj_t0.y[lead_idx, 0]])
-        velL_t0 = jnp.array([traj_t0.vel_x[lead_idx, 0], traj_t0.vel_y[lead_idx, 0]])
-        velL_prev = jnp.array([traj_prev.vel_x[lead_idx, 0], traj_prev.vel_y[lead_idx, 0]])
-
+        pos_lead_t0 = jnp.array([traj_t0.x[lead_idx, 0], traj_t0.y[lead_idx, 0]])
+        vel_lead_t0 = jnp.array([traj_t0.vel_x[lead_idx, 0], traj_t0.vel_y[lead_idx, 0]])
+        vel_lead_prev = jnp.array([traj_prev.vel_x[lead_idx, 0], traj_prev.vel_y[lead_idx, 0]])
+        
+        speed_lead_t0 = jnp.linalg.norm(vel_lead_t0)
+        speed_lead_prev = jnp.linalg.norm(vel_lead_prev)
+        acc_lead = (speed_lead_t0 - speed_lead_prev) / 0.1
         # Current gap (Euclidean distance)
         gap = jnp.sqrt((lead_x - av_x)**2 + (lead_y - av_y)**2)
         rel_speed = jnp.sqrt(lead_vx**2 + lead_vy**2) - jnp.sqrt(av_vx**2 + av_vy**2)
@@ -427,23 +432,56 @@ def MPC_actor(
 
             return a0, info
 
+        if actor_state is None:
+            # initialize reaction timer
+            actor_state = {"reaction_timer": 0,
+                           "has_reacted": jnp.array(False)}
+        SUDDEN_BRAKE_THRESHOLD = -2.0  # m/s^2
+        REACTION_STEPS = int(0.25 / datatypes.TIME_INTERVAL)
+
+        reaction_timer = actor_state["reaction_timer"]
+        has_reacted = actor_state["has_reacted"]
         
-        state_qp = {"x0": jnp.linalg.norm(pos_av_t0), "obs_x0": jnp.linalg.norm(posL_t0), "v0": speed_av_t0, "obs_v": jnp.linalg.norm(velL_t0), "a_prev": acc_av}
-        a0, info = select_action_waymax_jax(state_qp)
-        best_accel = a0[0]
-
-        direction_av = jnp.where(speed_av_t0 > 1e-3, vel_av_t0 / speed_av_t0, jnp.zeros_like(vel_av_t0))
-        new_speed_av = jnp.maximum(speed_av_t0 + best_accel* datatypes.TIME_INTERVAL, 0.0)
-        new_velocity_av = direction_av * new_speed_av
-
-        traj_t1 = traj_t0.replace(
-            x=traj_t0.x.at[av_idx].set(pos_av_t0[0] + new_velocity_av[0] * datatypes.TIME_INTERVAL),
-            y=traj_t0.y.at[av_idx].set(pos_av_t0[1] + new_velocity_av[1] * datatypes.TIME_INTERVAL),
-            vel_x=traj_t0.vel_x.at[av_idx].set(new_velocity_av[0]),
-            vel_y=traj_t0.vel_y.at[av_idx].set(new_velocity_av[1]),
-            valid=is_controlled[..., None] & traj_t0.valid,
-            timestamp_micros=traj_t0.timestamp_micros + datatypes.TIMESTEP_MICROS_INTERVAL,
+        leader_sudden_brake = acc_lead < jnp.asarray(SUDDEN_BRAKE_THRESHOLD, dtype=acc_lead.dtype)
+        start_reaction = (~has_reacted) & (reaction_timer == 0) & leader_sudden_brake
+        
+        reaction_timer = jnp.where(
+            start_reaction,
+            jnp.array(REACTION_STEPS, dtype=jnp.int32),
+            jnp.where(reaction_timer > 0, reaction_timer - 1, jnp.array(0, dtype=jnp.int32)),
         )
+        has_reacted = jnp.where(start_reaction, True, has_reacted)
+        
+        new_actor_state = {**actor_state, 
+                           "reaction_timer": reaction_timer,
+                           "has_reacted": has_reacted}
+
+        def during_reaction(_):
+            directionF = jnp.where(speed_av_t0 > 1e-3, vel_av_t0 / speed_av_t0, jnp.zeros_like(vel_av_t0))
+            new_speedF = jnp.maximum(speed_av_t0 + acc_av * datatypes.TIME_INTERVAL, 0.0)
+            new_velocity_av = directionF * new_speedF
+            return new_velocity_av
+        
+        def after_reaction(_):
+            state_qp = {"x0": jnp.linalg.norm(pos_av_t0), "obs_x0": jnp.linalg.norm(pos_lead_t0), "v0": speed_av_t0, "obs_v": jnp.linalg.norm(vel_lead_t0), "a_prev": acc_av}
+            a0, info = select_action_waymax_jax(state_qp)
+            best_accel = a0[0]
+
+            direction_av = jnp.where(speed_av_t0 > 1e-3, vel_av_t0 / speed_av_t0, jnp.zeros_like(vel_av_t0))
+            new_speed_av = jnp.maximum(speed_av_t0 + best_accel* datatypes.TIME_INTERVAL, 0.0)
+            new_velocity_av = direction_av * new_speed_av
+            return new_velocity_av
+        
+        new_velocity_av = jax.lax.cond(reaction_timer > 0, during_reaction, after_reaction, operand=None)
+        
+        traj_t1 = traj_t0.replace(
+                x=traj_t0.x.at[av_idx].set(pos_av_t0[0] + new_velocity_av[0] * datatypes.TIME_INTERVAL),
+                y=traj_t0.y.at[av_idx].set(pos_av_t0[1] + new_velocity_av[1] * datatypes.TIME_INTERVAL),
+                vel_x=traj_t0.vel_x.at[av_idx].set(new_velocity_av[0]),
+                vel_y=traj_t0.vel_y.at[av_idx].set(new_velocity_av[1]),
+                valid=is_controlled[..., None] & traj_t0.valid,
+                timestamp_micros=traj_t0.timestamp_micros + datatypes.TIMESTEP_MICROS_INTERVAL,
+            )
 
         traj_combined = jax.tree_util.tree_map(
             lambda x, y: jnp.concatenate([x, y], axis=-1), traj_t0, traj_t1
