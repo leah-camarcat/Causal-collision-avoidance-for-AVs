@@ -127,7 +127,7 @@ def detect_collision(trajectory, av_idx, lead_idx):
 
     jax.debug.print('proj:{}', proj[:45].min())
     # Collision threshold
-    collision_mask = (proj < 2) & (proj != 0)
+    collision_mask = (proj < (trajectory.length[av_index][0]/2 + trajectory.length[lead_idx][0]/2)) & (proj != 0)
 
     collision_happened = bool(jnp.any(collision_mask))
     first_collision_timestep = None

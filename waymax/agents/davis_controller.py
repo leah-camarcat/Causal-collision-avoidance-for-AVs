@@ -13,19 +13,9 @@ def davis_actor(
 ) -> actor_core.WaymaxActorCore:
     """Actor that computes acceleration/deceleration based on leading vehicle and AV states."""
 
-    def y_func(speedL, accL, speedF, headway, accF, r=0.7):
-        cond = jnp.logical_and(accL < 0, accL > -0.1)
-
-        y = jnp.where(
-            cond,
-            speedF * headway - r * speedF + (speedF ** 2) / (2 * accF + 1e-6),
-            speedF * headway + (speedL ** 2) / (2 * accL + 1e-6)
-            - r * speedF + (speedF ** 2) / (2 * accF + 1e-6),
-        )
-        return y
-    
-    def y_func_2(speedL, speedF, accF, posL, posF):
-        y = -(speedF**2) /((2 * jnp.abs(accF) + 1e-6)) + speedL*0.1 + jnp.linalg.norm(posL - posF)
+    def y_func(speedL, speedF, accF, posL, posF, lengthF, lengthL):
+        l = lengthF/2 + lengthL/2
+        y = -(speedF**2) /((2 * jnp.abs(accF) + 1e-6)) + speedL*0.1 + (jnp.linalg.norm(posL - posF) - l)
         return y
     
     def actor_init(rng, init_state):
@@ -72,6 +62,8 @@ def davis_actor(
         velL_t0 = jnp.array([traj_t0.vel_x[lead_idx, 0], traj_t0.vel_y[lead_idx, 0]])
         velL_prev = jnp.array([traj_prev.vel_x[lead_idx, 0], traj_prev.vel_y[lead_idx, 0]])
 
+        lengthF = traj_t0.length[av_idx, 0]
+        lengthL = traj_t0.length[lead_idx, 0]
         # ========== 计算速度标量 ==========
         speedF_t0 = jnp.linalg.norm(velF_t0)
         speedF_prev = jnp.linalg.norm(velF_prev)
@@ -105,7 +97,7 @@ def davis_actor(
 
         # Detect sudden leader braking
         SUDDEN_BRAKE_THRESHOLD = -2.0  # m/s^2
-        REACTION_STEPS = int(0.5 / datatypes.TIME_INTERVAL)
+        REACTION_STEPS = int(0.25 / datatypes.TIME_INTERVAL)
 
         # Step 1: read previous timer
         reaction_timer = actor_state["reaction_timer"]
@@ -147,7 +139,7 @@ def davis_actor(
 
             # Evaluate y_func for each candidate (counterfactual search)
             #y_vals = jax.vmap(lambda a: y_func(speedL_t0, accL, speedF_t0, headway, a))(candidates)
-            y_vals = jax.vmap(lambda a: y_func_2(speedL_t0, speedF_t0, accF, posL_t0, posF_t0))(candidates)
+            y_vals = jax.vmap(lambda a: y_func(speedL_t0, speedF_t0, accF, posL_t0, posF_t0, lengthF, lengthL))(candidates)
         
             # Mask of safe accelerations
             safe_mask = y_vals >= 0.0

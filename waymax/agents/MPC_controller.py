@@ -70,6 +70,9 @@ def MPC_actor(
         vel_lead_t0 = jnp.array([traj_t0.vel_x[lead_idx, 0], traj_t0.vel_y[lead_idx, 0]])
         vel_lead_prev = jnp.array([traj_prev.vel_x[lead_idx, 0], traj_prev.vel_y[lead_idx, 0]])
         
+        length_av = traj_t0.length[av_idx, 0]
+        length_lead = traj_t0.length[lead_idx, 0]
+
         speed_lead_t0 = jnp.linalg.norm(vel_lead_t0)
         speed_lead_prev = jnp.linalg.norm(vel_lead_prev)
         acc_lead = (speed_lead_t0 - speed_lead_prev) / 0.1

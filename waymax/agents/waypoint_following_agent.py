@@ -15,12 +15,12 @@
 """Implementations for waypoint following sim agents."""
 import abc
 from typing import Optional, Callable
-
+from collections import deque
 import chex
 import jax
 from jax import numpy as jnp
 import numpy as np
-
+import math
 from waymax import datatypes
 from waymax.agents import sim_agent
 from waymax.utils import geometry
@@ -44,7 +44,7 @@ _DISTANCE_TO_REF_THRESHOLD = 5.0  # Units: m
 # Max speed until which to consider an object stationary. Stationary objects
 # will not be updated by the sim agent.
 _STATIC_SPEED_THRESHOLD = 1.0  # Units: m/s
-
+_REACTION_TIME = 0.25  # Units: s
 
 class WaypointFollowingPolicy(sim_agent.SimAgentActor):
   """A base class for all waypoint-following sim agents.
@@ -198,282 +198,311 @@ class WaypointFollowingPolicy(sim_agent.SimAgentActor):
 
 
 class IDMRoutePolicy(WaypointFollowingPolicy):
-  """A policy implementing the intelligent driver model (IDM).
+    """A policy implementing the intelligent driver model (IDM) with perception delay."""
 
-  This policy uses IDM to compute the acceleration and velocities for the
-  agent while it follows its own logged future.
-  """
+    def __init__(
+        self,
+        is_controlled_func: Optional[Callable[[datatypes.SimulatorState], jax.Array]] = None,
+        desired_vel: float = 30.0,
+        min_spacing: float = 2.0,
+        safe_time_headway: float = 2.0,
+        max_accel: float = 2.0,
+        max_decel: float = 4.0,
+        delta: float = 4.0,
+        max_lookahead: int = 10,
+        lookahead_from_current_position: bool = True,
+        additional_lookahead_points: int = 10,
+        additional_lookahead_distance: float = 10.0,
+        invalidate_on_end: bool = False,
+        reaction_delay: float = 0.25,
+    ):
+        super().__init__(
+            is_controlled_func=is_controlled_func,
+            invalidate_on_end=invalidate_on_end,
+        )
+        self.desired_vel = desired_vel
+        self.min_spacing_s0 = min_spacing
+        self.safe_time_headway = safe_time_headway
+        self.max_accel = max_accel
+        self.max_decel = max_decel
+        self.delta = delta
+        self.max_lookahead = max_lookahead
+        self.lookahead_from_current_position = lookahead_from_current_position
+        self.additional_lookahead_distance = additional_lookahead_distance
+        self.additional_headway_points = additional_lookahead_points
+        self.reaction_delay = reaction_delay
 
-  def __init__(
-      self,
-      is_controlled_func: Optional[
-          Callable[[datatypes.SimulatorState], jax.Array]
-      ] = None,
-      desired_vel: float = 30.0,
-      min_spacing: float = 2.0,
-      safe_time_headway: float = 2.0,
-      max_accel: float = 2.0,
-      max_decel: float = 4.0,
-      delta: float = 4.0,
-      max_lookahead: int = 10,
-      lookahead_from_current_position: bool = True,
-      additional_lookahead_points: int = 10,
-      additional_lookahead_distance: float = 10.0,
-      invalidate_on_end: bool = False,
-  ):
-    super().__init__(
-        is_controlled_func=is_controlled_func,
-        invalidate_on_end=invalidate_on_end,
-    )
-    self.desired_vel = desired_vel
-    self.min_spacing_s0 = min_spacing
-    self.safe_time_headway = safe_time_headway
-    self.max_accel = max_accel
-    self.max_decel = max_decel
-    self.delta = delta
-    self.max_lookahead = max_lookahead
-    self.lookahead_from_current_position = lookahead_from_current_position
-    self.additional_lookahead_distance = additional_lookahead_distance
-    self.additional_headway_points = additional_lookahead_points
+    def update_speed(
+        self, state: datatypes.SimulatorState, dt: float = _DEFAULT_TIME_DELTA
+    ) -> tuple[jax.Array, jax.Array]:
+        """Returns the new speed for each agent in the current simulation step."""
 
-  def update_speed(
-      self, state: datatypes.SimulatorState, dt: float = _DEFAULT_TIME_DELTA
-  ) -> tuple[jax.Array, jax.Array]:
-    """Returns the new speed for each agent in the current simulation step.
+        # Retrieve the log trajectory and current simulation trajectory
+        log_waypoints = state.log_trajectory
+        cur_position = state.current_sim_trajectory.xyz[..., 0, :]
+        cur_speed = state.current_sim_trajectory.speed[..., 0]
 
-    Args:
-      state: The simulator state of shape (...).
-      dt: Delta between timesteps of the simulator state.
+        # Apply reaction delay to the log trajectory
+        delayed_log_waypoints = self._apply_reaction_delay(log_waypoints)
 
-    Returns:
-      speeds: A (..., num_objects) float array of speeds.
-      valids: A (..., num_objects) bool array of valids.
-    """
-    # Shape: (..., num_objects, num_timesteps).
-    log_waypoints = state.log_trajectory
-    # Shape: (..., num_objects, 3).
-    cur_position = state.current_sim_trajectory.xyz[..., 0, :]
-    cur_speed = state.current_sim_trajectory.speed[..., 0]
+        # Compute acceleration using the delayed log trajectory
+        accel = self._get_accel(
+            delayed_log_waypoints, cur_position, cur_speed, state.current_sim_trajectory
+        )
+        valid = jnp.ones_like(cur_speed, dtype=jnp.bool_)
 
-    # Shape: (..., num_objects).
-    accel = self._get_accel(
-        log_waypoints, cur_position, cur_speed, state.current_sim_trajectory
-    )
+        # Update speed based on acceleration and ensure it's non-negative
+        speed = cur_speed + dt * accel
+        speed = jnp.where(speed < 0, 0, speed)
+        return speed, valid
 
-    valid = jnp.ones_like(cur_speed, dtype=jnp.bool_)
+    def _apply_reaction_delay(self, log_waypoints: datatypes.Trajectory) -> datatypes.Trajectory:
+        """Applies a reaction delay to the log trajectory."""
+        def shift_time(traj: datatypes.Trajectory, delay_steps: int) -> datatypes.Trajectory:
+          """
+          Shifts a Trajectory forward by `delay_steps` to simulate perception delay.
 
-    speed = cur_speed + dt * accel
-    # Speed non-negative.
-    speed = jnp.where(speed < 0, 0, speed)
-    return speed, valid
+          Args:
+              traj: The Trajectory object to shift.
+              delay_steps: Number of timesteps to shift forward.
 
-  def _get_accel(
+          Returns:
+              A new Trajectory object with shifted timesteps.
+          """
+          if delay_steps <= 0:
+              return traj  # No shift
+
+          # Helper function to shift a single field
+          def shift_field(field: jax.Array) -> jax.Array:
+              # Shape (..., num_objects, num_timesteps)
+              pad_shape = list(field.shape[:-1]) + [delay_steps]
+              pad_values = jnp.broadcast_to(field[..., 0:1], pad_shape)  # repeat first timestep
+              shifted = jnp.concatenate([pad_values, field[..., :-delay_steps]], axis=-1)
+              return shifted
+
+          # Apply shift to all trajectory fields
+          shifted_traj = traj.replace(
+              x=shift_field(traj.x),
+              y=shift_field(traj.y),
+              yaw=shift_field(traj.yaw),
+              vel_x=shift_field(traj.vel_x),
+              vel_y=shift_field(traj.vel_y),
+              valid=shift_field(traj.valid),
+          )
+          return shifted_traj
+        # Shift the log trajectory by the reaction delay
+        delay_steps = int(self.reaction_delay / _DEFAULT_TIME_DELTA)
+        delayed_log_waypoints = shift_time(log_waypoints, delay_steps)
+        return delayed_log_waypoints
+
+    def _get_accel(
       self,
       log_waypoints: datatypes.Trajectory,
       cur_position: jax.Array,
       cur_speed: jax.Array,
       obj_curr_traj: datatypes.Trajectory,
   ) -> jax.Array:
-    """Computes vehicle accelerations according to IDM for a single vehicle.
+      """Computes vehicle accelerations according to IDM for a single vehicle.
 
-    Note log_waypoints and obj_curr_traj contain the same set of objects, thus
-    need to remove collision against oneself when computing pairwise collision.
+      Note log_waypoints and obj_curr_traj contain the same set of objects, thus
+      need to remove collision against oneself when computing pairwise collision.
 
-    Args:
-      log_waypoints: A trajectory of the agents' future of shape (...,
-        num_objects, num_timesteps).
-      cur_position: Current positions for the agents of shape (..., num_objects,
-        3).
-      cur_speed: Current speeds for the agents of shape (..., num_objects).
-      obj_curr_traj: Trajectory containing the state for all current objects of
-        shape (..., num_objects, num_timesteps=1).
+      Args:
+        log_waypoints: A trajectory of the agents' future of shape (...,
+          num_objects, num_timesteps).
+        cur_position: Current positions for the agents of shape (..., num_objects,
+          3).
+        cur_speed: Current speeds for the agents of shape (..., num_objects).
+        obj_curr_traj: Trajectory containing the state for all current objects of
+          shape (..., num_objects, num_timesteps=1).
 
-    Returns:
-      A vector of all vehicles' accelerations after solving for them of shape
-        (..., num_objects).
-    """
-    num_obj = obj_curr_traj.num_objects
-    prefix_shape = obj_curr_traj.shape[:-2]
-    chex.assert_equal_shape_prefix(
-        [log_waypoints, cur_position, cur_speed, obj_curr_traj],
-        len(prefix_shape) + 1,
-    )
-    log_waypoints.validate()
-    obj_curr_traj.validate()
-    # 1. Find the closest waypoint and slice the future from that waypoint.
-    if self.lookahead_from_current_position:
-      traj = _find_reference_traj_from_log_traj(cur_position, obj_curr_traj, 1)
-      chex.assert_shape(traj.xyz, prefix_shape + (num_obj, 1, 3))
-      total_lookahead = 1 + self.additional_headway_points
-    else:
-      traj = _find_reference_traj_from_log_traj(
-          cur_position, log_waypoints, self.max_lookahead
+      Returns:
+        A vector of all vehicles' accelerations after solving for them of shape
+          (..., num_objects).
+      """
+      num_obj = obj_curr_traj.num_objects
+      prefix_shape = obj_curr_traj.shape[:-2]
+      chex.assert_equal_shape_prefix(
+          [log_waypoints, cur_position, cur_speed, obj_curr_traj],
+          len(prefix_shape) + 1,
       )
-      chex.assert_shape(
-          traj.xyz, prefix_shape + (num_obj, self.max_lookahead, 3)
+      log_waypoints.validate()
+      obj_curr_traj.validate()
+      # 1. Find the closest waypoint and slice the future from that waypoint.
+      if self.lookahead_from_current_position:
+        traj = _find_reference_traj_from_log_traj(cur_position, obj_curr_traj, 1)
+        chex.assert_shape(traj.xyz, prefix_shape + (num_obj, 1, 3))
+        total_lookahead = 1 + self.additional_headway_points
+      else:
+        traj = _find_reference_traj_from_log_traj(
+            cur_position, log_waypoints, self.max_lookahead
+        )
+        chex.assert_shape(
+            traj.xyz, prefix_shape + (num_obj, self.max_lookahead, 3)
+        )
+        total_lookahead = self.max_lookahead + self.additional_headway_points
+
+
+      if self.additional_headway_points > 0:
+        traj = _add_headway_waypoints(
+            traj,
+            distance=self.additional_lookahead_distance,
+            num_points=self.additional_headway_points,
+        )
+
+      # 2. Computes collision indicator as (..., num_objects, num_objects,
+      # max_lookahead) between traj (..., num_objects, max_lookahead) and
+      # obj_curr_traj (..., num_objects, 1). Make common shape for bboxes:
+      # (..., num_objects, num_objects, max_lookahead, 5).
+      broadcast_shape = prefix_shape + (num_obj, num_obj, total_lookahead, 5)
+      traj_5dof = traj.stack_fields(['x', 'y', 'length', 'width', 'yaw'])
+      traj_bbox = jnp.broadcast_to(
+          jnp.expand_dims(traj_5dof, axis=-3), broadcast_shape
       )
-      total_lookahead = self.max_lookahead + self.additional_headway_points
-
-
-    if self.additional_headway_points > 0:
-      traj = _add_headway_waypoints(
-          traj,
-          distance=self.additional_lookahead_distance,
-          num_points=self.additional_headway_points,
+      obj_curr_5dof = obj_curr_traj.stack_fields(
+          ['x', 'y', 'length', 'width', 'yaw']
+      )
+      obj_bbox = jnp.broadcast_to(
+          jnp.expand_dims(obj_curr_5dof, axis=-4), broadcast_shape
+      )
+      # collision[..., i, j, t] represents if obj i collides with obj j at time t.
+      collision_pairwise = geometry.has_overlap(traj_bbox, obj_bbox)
+      self_mask = jnp.expand_dims(
+          jnp.eye(num_obj, dtype=jnp.bool_)[..., jnp.newaxis],
+          axis=np.arange(len(prefix_shape)),
+      )
+      collision_valid = (
+          traj.valid[..., jnp.newaxis, :]
+          & obj_curr_traj.valid[..., jnp.newaxis, :, :]
+          & ~self_mask
       )
 
-    # 2. Computes collision indicator as (..., num_objects, num_objects,
-    # max_lookahead) between traj (..., num_objects, max_lookahead) and
-    # obj_curr_traj (..., num_objects, 1). Make common shape for bboxes:
-    # (..., num_objects, num_objects, max_lookahead, 5).
-    broadcast_shape = prefix_shape + (num_obj, num_obj, total_lookahead, 5)
-    traj_5dof = traj.stack_fields(['x', 'y', 'length', 'width', 'yaw'])
-    traj_bbox = jnp.broadcast_to(
-        jnp.expand_dims(traj_5dof, axis=-3), broadcast_shape
-    )
-    obj_curr_5dof = obj_curr_traj.stack_fields(
-        ['x', 'y', 'length', 'width', 'yaw']
-    )
-    obj_bbox = jnp.broadcast_to(
-        jnp.expand_dims(obj_curr_5dof, axis=-4), broadcast_shape
-    )
-    # collision[..., i, j, t] represents if obj i collides with obj j at time t.
-    collision_pairwise = geometry.has_overlap(traj_bbox, obj_bbox)
-    self_mask = jnp.expand_dims(
-        jnp.eye(num_obj, dtype=jnp.bool_)[..., jnp.newaxis],
-        axis=np.arange(len(prefix_shape)),
-    )
-    collision_valid = (
-        traj.valid[..., jnp.newaxis, :]
-        & obj_curr_traj.valid[..., jnp.newaxis, :, :]
-        & ~self_mask
-    )
+      # (..., num_objects, num_objects, max_lookahead).
+      collision_pairwise = jnp.where(collision_valid, collision_pairwise, False)
 
-    # (..., num_objects, num_objects, max_lookahead).
-    collision_pairwise = jnp.where(collision_valid, collision_pairwise, False)
+      # 3. Gets velocity and distance to leading obj (defined as the one with
+      # collision).
+      # (..., num_objects, 1) -> (..., num_objects, num_objects, max_lookahead).
+      obj_speed_tiled = jnp.broadcast_to(
+          jnp.expand_dims(obj_curr_traj.speed, axis=-3), collision_pairwise.shape
+      )
+      lead_vel = self._compute_lead_velocity(
+          obj_speed_tiled,
+          collision_pairwise,
+          obj_curr_traj.valid[..., jnp.newaxis, :, :],
+      )
 
-    # 3. Gets velocity and distance to leading obj (defined as the one with
-    # collision).
-    # (..., num_objects, 1) -> (..., num_objects, num_objects, max_lookahead).
-    obj_speed_tiled = jnp.broadcast_to(
-        jnp.expand_dims(obj_curr_traj.speed, axis=-3), collision_pairwise.shape
-    )
-    lead_vel = self._compute_lead_velocity(
-        obj_speed_tiled,
-        collision_pairwise,
-        obj_curr_traj.valid[..., jnp.newaxis, :, :],
-    )
+      # agent_future Shape: (..., num_objects, max_lookahead, 3).
+      # collision_indicator: (..., num_objects, max_lookahead).
+      lead_dist = self._compute_lead_distance(
+          agent_future=traj.xyz,
+          collision_indicator=collision_pairwise.any(axis=-2),
+          current_position=obj_curr_traj.xyz,
+          agent_future_valid=traj.valid,
+      )
 
-    # agent_future Shape: (..., num_objects, max_lookahead, 3).
-    # collision_indicator: (..., num_objects, max_lookahead).
-    lead_dist = self._compute_lead_distance(
-        agent_future=traj.xyz,
-        collision_indicator=collision_pairwise.any(axis=-2),
-        current_position=obj_curr_traj.xyz,
-        agent_future_valid=traj.valid,
-    )
+      # 4. Compute accel according to IDM formula.
+      s_star = self.min_spacing_s0 + jnp.maximum(
+          0,
+          cur_speed * self.safe_time_headway
+          + cur_speed
+          * (cur_speed - lead_vel)
+          / (2 * jnp.sqrt(self.max_accel * self.max_decel)),
+      )
+      # Set 0 for free-road behaviour.
+      s_star = jnp.where(
+          (lead_dist == _DEFAULT_LEAD_DISTANCE)
+          | (lead_vel == _DEFAULT_LEAD_VELOCITY),
+          0,
+          s_star,
+      )
 
-    # 4. Compute accel according to IDM formula.
-    s_star = self.min_spacing_s0 + jnp.maximum(
-        0,
-        cur_speed * self.safe_time_headway
-        + cur_speed
-        * (cur_speed - lead_vel)
-        / (2 * jnp.sqrt(self.max_accel * self.max_decel)),
-    )
-    # Set 0 for free-road behaviour.
-    s_star = jnp.where(
-        (lead_dist == _DEFAULT_LEAD_DISTANCE)
-        | (lead_vel == _DEFAULT_LEAD_VELOCITY),
-        0,
-        s_star,
-    )
-
-    lead_dist = jnp.where(lead_dist == 0, _MINIMUM_LEAD_DISTANCE, lead_dist)
-    return self.max_accel * (
-        1
-        - (cur_speed / self.desired_vel) ** self.delta
-        - (s_star / lead_dist) ** 2
-    )
-
-  def _compute_lead_velocity(
+      lead_dist = jnp.where(lead_dist == 0, _MINIMUM_LEAD_DISTANCE, lead_dist)
+      return self.max_accel * (
+          1
+          - (cur_speed / self.desired_vel) ** self.delta
+          - (s_star / lead_dist) ** 2
+      )
+    
+    def _compute_lead_velocity(
       self,
       future_speeds: jax.Array,
       collisions_per_agent: jax.Array,
       future_speeds_valid: Optional[jax.Array] = None,
   ) -> jax.Array:
-    """Computes the velocity of the object at the closest collision.
+      """Computes the velocity of the object at the closest collision.
 
-    Args:
-      future_speeds: Future speeds per agent of shape (..., num_objects,
-        num_timesteps).
-      collisions_per_agent: Future collision indications of shape (...,
-        num_objects, num_timesteps).
-      future_speeds_valid: Boolean mask for future speeds of shape (...,
-        num_objects, num_timesteps).
+      Args:
+        future_speeds: Future speeds per agent of shape (..., num_objects,
+          num_timesteps).
+        collisions_per_agent: Future collision indications of shape (...,
+          num_objects, num_timesteps).
+        future_speeds_valid: Boolean mask for future speeds of shape (...,
+          num_objects, num_timesteps).
 
-    Returns:
-      An array containing the velocity of the colliding object at the
-        closest collision of shape (...).
-    """
-    # Shape: (..., num_objects, num_timesteps).
-    collision_vels_at = jnp.where(collisions_per_agent, future_speeds, jnp.inf)
-    if future_speeds_valid is not None:
-      collision_vels_at = jnp.where(
-          future_speeds_valid, collision_vels_at, jnp.inf
-      )
-    # In the rare case of multiple collisions, take the closest one.
-    # Shape: (..., num_timesteps).
-    collision_vels_t = jnp.min(collision_vels_at, axis=-2)
-    mask_t = jnp.isfinite(collision_vels_t)
-    cumsum_t = jnp.cumsum(jnp.where(mask_t, collision_vels_t, 0), axis=-1)
-    # Shape: (..., num_timesteps).
-    collision_vels_cum = jnp.where(mask_t, cumsum_t, jnp.inf)
-    # Shape: (...)
-    lead_vel = jnp.min(collision_vels_cum, axis=-1)
+      Returns:
+        An array containing the velocity of the colliding object at the
+          closest collision of shape (...).
+      """
+      # Shape: (..., num_objects, num_timesteps).
+      collision_vels_at = jnp.where(collisions_per_agent, future_speeds, jnp.inf)
+      if future_speeds_valid is not None:
+        collision_vels_at = jnp.where(
+            future_speeds_valid, collision_vels_at, jnp.inf
+        )
+      # In the rare case of multiple collisions, take the closest one.
+      # Shape: (..., num_timesteps).
+      collision_vels_t = jnp.min(collision_vels_at, axis=-2)
+      mask_t = jnp.isfinite(collision_vels_t)
+      cumsum_t = jnp.cumsum(jnp.where(mask_t, collision_vels_t, 0), axis=-1)
+      # Shape: (..., num_timesteps).
+      collision_vels_cum = jnp.where(mask_t, cumsum_t, jnp.inf)
+      # Shape: (...)
+      lead_vel = jnp.min(collision_vels_cum, axis=-1)
 
-    return jnp.where(jnp.isfinite(lead_vel), lead_vel, _DEFAULT_LEAD_VELOCITY)
+      return jnp.where(jnp.isfinite(lead_vel), lead_vel, _DEFAULT_LEAD_VELOCITY)
 
-  def _compute_lead_distance(
-      self,
-      agent_future: jax.Array,
-      collision_indicator: jax.Array,
-      agent_future_valid: Optional[jax.Array] = None,
-      current_position: Optional[jax.Array] = None,
-      use_arclength=False,
-  ) -> jax.Array:
-    """Computes the distance between the agent and the nearest collision.
 
-    Args:
-      agent_future: Agent's future positions {x, y, z} of shape (...,
-        num_timesteps, 3).
-      collision_indicator: Collision indications of shape (..., num_timesteps).
-      agent_future_valid: Boolean mask for agent's future positions of shape
-        (..., num_timesteps).
-      current_position: Array of the vehicle's current positions {x, y, z} of
-        shape  (..., 1, 3). If None, will use the first element of agent_future
-        as the current position.
-      use_arclength: Whether to use arclength for computing collisions.
-        Arclength is more accurate but is not robust to futures with mixed
-        valids.
+    def _compute_lead_distance(
+        self,
+        agent_future: jax.Array,
+        collision_indicator: jax.Array,
+        agent_future_valid: Optional[jax.Array] = None,
+        current_position: Optional[jax.Array] = None,
+        use_arclength=False,
+    ) -> jax.Array:
+      """Computes the distance between the agent and the nearest collision.
 
-    Returns:
-      An array of distances to the agent's closest collision of shape (...).
-    """
-    if use_arclength:
-      arc_lengths = _compute_arclengths(agent_future, agent_future_valid)
-      cum_arc_length = jnp.cumsum(arc_lengths, axis=-1)
-    else:
-      if current_position is None:
-        current_position = agent_future[..., 0:1, :]
-      dists = jnp.linalg.norm(current_position - agent_future, axis=-1)
-      cum_arc_length = dists
+      Args:
+        agent_future: Agent's future positions {x, y, z} of shape (...,
+          num_timesteps, 3).
+        collision_indicator: Collision indications of shape (..., num_timesteps).
+        agent_future_valid: Boolean mask for agent's future positions of shape
+          (..., num_timesteps).
+        current_position: Array of the vehicle's current positions {x, y, z} of
+          shape  (..., 1, 3). If None, will use the first element of agent_future
+          as the current position.
+        use_arclength: Whether to use arclength for computing collisions.
+          Arclength is more accurate but is not robust to futures with mixed
+          valids.
 
-    # Shape: (..., num_timesteps).
-    dists_to_collision = jnp.where(collision_indicator, cum_arc_length, jnp.inf)
-    # Shape: (...).
-    lead_dist = jnp.min(dists_to_collision, axis=-1)
-    return jnp.where(jnp.isfinite(lead_dist), lead_dist, _DEFAULT_LEAD_DISTANCE)
+      Returns:
+        An array of distances to the agent's closest collision of shape (...).
+      """
+      if use_arclength:
+        arc_lengths = _compute_arclengths(agent_future, agent_future_valid)
+        cum_arc_length = jnp.cumsum(arc_lengths, axis=-1)
+      else:
+        if current_position is None:
+          current_position = agent_future[..., 0:1, :]
+        dists = jnp.linalg.norm(current_position - agent_future, axis=-1)
+        cum_arc_length = dists
+
+      # Shape: (..., num_timesteps).
+      dists_to_collision = jnp.where(collision_indicator, cum_arc_length, jnp.inf)
+      # Shape: (...).
+      lead_dist = jnp.min(dists_to_collision, axis=-1)
+      return jnp.where(jnp.isfinite(lead_dist), lead_dist, _DEFAULT_LEAD_DISTANCE)
 
 
 def _find_reference_traj_from_log_traj(

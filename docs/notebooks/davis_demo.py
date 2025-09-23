@@ -147,9 +147,9 @@ def detect_collision(trajectory, av_idx, lead_idx):
     diff = p_obj - p_av
     proj = np.einsum('ij,ij->i', diff, v_av_norm)
 
-    jax.debug.print('proj:{}', proj[:50])
+    jax.debug.print('proj:{}', proj)
     # Collision threshold
-    collision_mask = proj < 0
+    collision_mask = (proj < (trajectory.length[av_index][0]/2 + trajectory.length[lead_idx][0]/2)) & (proj != 0)
 
     collision_happened = bool(jnp.any(collision_mask))
     first_collision_timestep = None
@@ -191,7 +191,7 @@ for scenario_idx, scenario in enumerate(data_iter):
     scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
     #if scenario_id == '1fb44c31801c956d':
     #if scenario_id == 'cd7a6be74ecc125a':
-    if scenario_id == '947baabccbbe1580':
+    if scenario_id == 'ada30f16b8df13c4':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         leading_vehicles = find_leading_vehicles(scenario)
@@ -244,7 +244,7 @@ obj_idx = jnp.arange(max_num_objects)
 actor_0 = agents.create_constant_acceleration_actor(
     dynamics_model=dynamics_model,
     is_controlled_func=lambda state: obj_idx == leading_index,
-    acceleration=-6
+    acceleration=-5.884
 )
 
 # IDM actor/policy controlling both object 0 and 1.
@@ -317,7 +317,7 @@ for _ in range(t, T):
   next_state = jit_step(clean_state, action)
   trajectories.append(next_state)
 
-  if next_state.timestep < 50:
+  if next_state.timestep < 55:
 
     states.append(next_state)
 
@@ -333,7 +333,7 @@ for _ in range(t, T):
     imgs = []
     for state in states:
         imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-    with imageio.get_writer(f'docs/processed_data/{scenario_id}_davis.mp4', fps=10) as writer:
+    with imageio.get_writer(f'docs/processed_data/{scenario_id}_davis_R.mp4', fps=10) as writer:
         for frame in imgs:
             writer.append_data(frame)
 
@@ -342,6 +342,7 @@ collision, t_col, v_av, v_lead, delta_v = detect_collision(
                 av_idx=av_index,
                 lead_idx=leading_index,
             )
+
 print(f'collision: {collision}')
 
 # with open(f"../processed_data/{scenario_id}_m.pkl", "wb") as f:
