@@ -21,9 +21,13 @@ from waymax.agents.agent_builder import create_sim_agents_from_config
 from waymax.agents.constant_speed import create_constant_speed_actor
 from waymax.agents.acc_heading import create_acceleration_heading_actor
 from waymax.agents.constant_acceleration import create_constant_acceleration_actor
+from waymax.agents.lane_change import create_lane_change_actor
 from waymax.agents.expert import create_expert_actor
 from waymax.agents.sim_agent import FrozenSimPolicy
 from waymax.agents.sim_agent import SimAgentActor
 from waymax.agents.waypoint_following_agent import IDMRoutePolicy
 from waymax.agents.waypoint_following_agent import WaypointFollowingPolicy
 from waymax.agents.davis_controller import davis_actor
+from waymax.agents.causal_ellipse_controller import causal_ellipse_actor
+from waymax.agents.MPC_controller import MPC_actor
+
