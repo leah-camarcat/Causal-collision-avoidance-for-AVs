@@ -476,6 +476,7 @@ def MPC_actor(
             return new_velocity_av
         
         new_velocity_av = jax.lax.cond(reaction_timer > 0, during_reaction, after_reaction, operand=None)
+        jax.debug.print("new velocity: {}", new_velocity_av)
         
         traj_t1 = traj_t0.replace(
                 x=traj_t0.x.at[av_idx].set(pos_av_t0[0] + new_velocity_av[0] * datatypes.TIME_INTERVAL),
@@ -493,7 +494,7 @@ def MPC_actor(
 
 
         return actor_core.WaymaxActorOutput(
-            actor_state=actor_state,
+            actor_state=new_actor_state,
             action=actions,
             is_controlled=is_controlled
         )

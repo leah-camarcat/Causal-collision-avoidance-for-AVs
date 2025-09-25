@@ -300,7 +300,7 @@ WOD_1_3_0_TEST = DatasetConfig(
     data_format=DataFormat.TFRECORD,
 )
 WOD_1_3_0_TRAIN_EX = DatasetConfig(
-    path='data/motion_v_1_3_0/uncompressed/tf_example/training/training_tfexample.tfrecord-00004-of-01000',
+    path='data/motion_v_1_3_0/uncompressed/tf_example/training/training_tfexample.tfrecord-00015-of-01000',
     max_num_rg_points=30000,
     data_format=DataFormat.TFRECORD,
 )

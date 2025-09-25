@@ -30,4 +30,4 @@ from waymax.agents.waypoint_following_agent import WaypointFollowingPolicy
 from waymax.agents.davis_controller import davis_actor
 from waymax.agents.causal_ellipse_controller import causal_ellipse_actor
 from waymax.agents.MPC_controller import MPC_actor
-
+from waymax.agents.MPC_2D import MPC_2D_actor

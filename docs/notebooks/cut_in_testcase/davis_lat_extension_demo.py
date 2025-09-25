@@ -60,7 +60,7 @@ def find_leading_vehicles(scenario):
         longitudinal_dist = np.abs(proj)
 
         # 初步条件
-        valid_mask = (cos_angle > 0.9) & (lateral_dist < 0.5) & (proj > 0) & (longitudinal_dist <= 25)
+        valid_mask = (cos_angle > 0.9) & (lateral_dist < 0.5) & (proj > 0) & (longitudinal_dist >= 25)
 
         # 检查纵向距离递减连续段
         consecutive_count = 0
@@ -158,7 +158,8 @@ def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
                 candidate_dist = mean_dist
                 candidate_side = side_mask
 
-    return candidate
+    return candidate, candidate_side
+
 
 def strip_scenario_id(state):
     """Return a copy of state where scenario_id is replaced by a JAX-friendly placeholder.
@@ -188,28 +189,29 @@ data_iter = dataloader.simulator_state_generator(config=config)
 for scenario_idx, scenario in enumerate(data_iter):
     scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
     #if scenario_id == '1fb44c31801c956d':
-    if scenario_id == '5130b590379b4722':
-        # if scenario_id == '5a70fde6044f2ab4':
-        #if scenario_id == 'cd7a6be74ecc125a':
+    #if scenario_id == '5130b590379b4722':
+    #if scenario_id == '1ba54b48c61a6e1b':
+    if scenario_id == '10f5ea040a3e4acd':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
-        jax.debug.print('av index:{}', av_index)
-        leading_vehicles_results = find_adjacent_leading_vehicles(scenario)
-        leading_vehicles = leading_vehicles_results[:,0]
-        distances = []
-        for i in leading_vehicles:
-            dx = scenario.log_trajectory.x[i, :91] - scenario.log_trajectory.x[av_index, :91]
-            dy = scenario.log_trajectory.y[i, :91] - scenario.log_trajectory.y[av_index, :91]
-            dist = np.mean(np.sqrt(dx ** 2 + dy ** 2))
-            distances.append(dist)
-        leading_index = leading_vehicles[np.argmin(distances)]
+        leading_vehicles_results = find_adjacent_vehicle(scenario, av_index)
+        leading_index = leading_vehicles_results[0]
+        jax.debug.print('leading_index:{}', leading_index)
+        #distances = []
+        #for i in leading_vehicles:
+        #    dx = scenario.log_trajectory.x[i, :91] - scenario.log_trajectory.x[av_index, :91]
+        #    dy = scenario.log_trajectory.y[i, :91] - scenario.log_trajectory.y[av_index, :91]
+        #    dist = np.mean(np.sqrt(dx ** 2 + dy ** 2))
+        #    distances.append(dist)
+        #leading_index = leading_vehicles[np.argmin(distances)]
         break
 
 # Config the multi-agent environment:
-init_steps = leading_vehicles_results[np.argmin(distances), 1]
-jax.debug.print("initial timestep={} for vehicle id: {}", init_steps, leading_index)
-side = leading_vehicles_results[np.argmin(distances), 2]
-
+#init_steps = leading_vehicles_results[np.argmin(distances), 1]
+#jax.debug.print("initial timestep={} for vehicle id: {}", init_steps, leading_index)
+#side = leading_vehicles_results[np.argmin(distances), 2]
+lead_side = leading_vehicles_results[1]
+init_steps = 11
 dynamics_model = dynamics.StateDynamics()
 
 # Expect users to control all valid object in the scene.
@@ -228,7 +230,8 @@ obj_idx = jnp.arange(max_num_objects)
 # leading vehicle control
 actor_0 = agents.create_lane_change_actor(
     dynamics_model=dynamics_model,
-    is_controlled_func=lambda state: obj_idx == leading_index
+    is_controlled_func=lambda state: obj_idx == leading_index,
+    side = lead_side
 )
 
 # IDM actor/policy controlling both object 0 and 1.
@@ -238,13 +241,19 @@ actor_0 = agents.create_lane_change_actor(
 #    is_controlled_func=lambda state: obj_idx == av_index
 #)
 
-actor_1 = agents.causal_ellipse_actor(
+actor_1 = agents.MPC_2D_actor(
     dynamics_model=dynamics_model,
     is_controlled_func=lambda state: obj_idx == av_index,
     av_idx=av_index,
-    neigh_idx=leading_index,
+    obs_idx=leading_index,
 )
 
+#actor_1 = agents.MPC_actor(
+#    dynamics_model=dynamics_model,
+#    is_controlled_func=lambda state: obj_idx == av_index,
+#    av_idx=av_index,
+#    lead_idx=leading_index,
+#)
 
 actors = [actor_0, actor_1]  # include all the vehicles you want to change
 jit_step = jax.jit(env.step)
@@ -269,6 +278,7 @@ for _ in range(t, T):
 
     for i, jit_select_action in enumerate(jit_select_action_list):
         out = jit_select_action({}, clean_state, actor_states[i], None)
+        #out = jit_select_action({}, clean_state, actor_states[i], None)
         outputs.append(out)
         new_actor_states.append(out.actor_state)
 
@@ -283,38 +293,12 @@ for _ in range(t, T):
         imgs = []
         for state in states:
             imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-        with imageio.get_writer(f'../processed_data/{scenario_id}_IDM_lanechange.mp4', fps=10) as writer:
+        with imageio.get_writer(f'docs/processed_data/{scenario_id}_MPC2d_lanechange.mp4', fps=10) as writer:
             for frame in imgs:
                 writer.append_data(frame)
     else:
         break
-  current_state = states[-1]
-
-  clean_state = strip_scenario_id(current_state)
-  outputs = []
-  new_actor_states = []
-  
-  for i, jit_select_action in enumerate(jit_select_action_list):
-    out = jit_select_action({}, clean_state, actor_states[i], None)
-    outputs.append(out)
-    new_actor_states.append(out.actor_state)
-
-  actor_states = new_actor_states
-  action = agents.merge_actions(outputs)
-  next_state = jit_step(clean_state, action)
-
-  if next_state.timestep < 55:
-
-    states.append(next_state)
-
-    imgs = []
-    for state in states:
-        imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-    with imageio.get_writer(f'docs/processed_data/{scenario_id}_ellipse_lanechange.mp4', fps=10) as writer:
-        for frame in imgs:
-            writer.append_data(frame)
-  else:
-      break
+    
 
 # with open(f"../processed_data/{scenario_id}_m.pkl", "wb") as f:
 #     pickle.dump(tensor, f)
