@@ -1,5 +1,6 @@
 import sys
 import os
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 import dataclasses
 
@@ -101,6 +102,7 @@ def strip_scenario_id(state):
     )
     return dataclasses.replace(state, object_metadata=clean_metadata)
 
+
 def detect_collision(trajectory, av_idx, lead_idx):
     """
     Returns:
@@ -162,12 +164,12 @@ def detect_collision(trajectory, av_idx, lead_idx):
 def compute_jerk(log_trajectory, veh_idx, dt=0.1):
     """
     Compute jerk magnitude (m/s^3) over time for a given vehicle.
-    
+
     Args:
         log_trajectory: scenario.log_trajectory
         veh_idx: index of the vehicle (AV or leader)
         dt: timestep size in seconds (default 0.1s, adjust to your sim)
-    
+
     Returns:
         jerk: array of jerk magnitudes at each timestep (len = T-2)
         max_jerk: maximum jerk magnitude
@@ -185,7 +187,7 @@ def compute_jerk(log_trajectory, veh_idx, dt=0.1):
     jy = jnp.gradient(ay, dt)
 
     # Magnitude of jerk
-    jerk = jnp.sqrt(jx**2 + jy**2)
+    jerk = jnp.sqrt(jx ** 2 + jy ** 2)
 
     return jerk, float(jnp.max(jerk)), float(jnp.mean(jerk))
 
@@ -213,31 +215,29 @@ KPIS_dict = {
     for decel in decel_values
 }
 
-
-
 processed_scenarios = set()
 pending_scenarios = set(filtered_scenarios)
 
 for shard_idx, shard_file in enumerate(tfrecord_files):
-    
+
     config = dataclasses.replace(
         _config.WOD_1_3_0_TRAIN_EX,
-        path=shard_file,  
+        path=shard_file,
         max_num_objects=max_num_objects
     )
-    
+
     all_counts = sum(1 for _ in tf.data.TFRecordDataset(shard_file))
     jax.debug.print("There are {} scenarios in {}", all_counts, shard_file.split('/')[-1])
 
     data_iter = dataloader.simulator_state_generator(config=config)
 
     for scenario_idx in range(all_counts):
-        scenario = next(islice(data_iter, scenario_idx, scenario_idx+1))
+        scenario = next(islice(data_iter, scenario_idx, scenario_idx + 1))
         scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
         if (scenario_id not in filtered_scenarios) or (scenario_id in processed_scenarios):
             continue
 
-        #jax.debug.print("Scenario id: {}", scenario_id)
+        # jax.debug.print("Scenario id: {}", scenario_id)
 
         jax.debug.print("Processing scenario: {}", scenario_id)
         is_sdc_mask = scenario.object_metadata.is_sdc
@@ -275,16 +275,16 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
                 acceleration=decel
             )
 
-            actor_1 = agents.davis_actor(
-                dynamics_model=dynamics_model,
-                is_controlled_func=lambda state: obj_idx == av_index,
-                av_idx=av_index,
-                lead_idx=leading_index,
-            )
+            # actor_1 = agents.davis_actor(
+            #     dynamics_model=dynamics_model,
+            #     is_controlled_func=lambda state: obj_idx == av_index,
+            #     av_idx=av_index,
+            #     lead_idx=leading_index,
+            # )
 
-            #actor_1 = agents.IDMRoutePolicy(
-            #    is_controlled_func=lambda state: obj_idx == av_index,
-            #)
+            actor_1 = agents.IDMRoutePolicy(
+               is_controlled_func=lambda state: obj_idx == av_index,
+            )
 
             # actor_1 = agents.MPC_actor(
             #     dynamics_model=dynamics_model,
@@ -308,46 +308,30 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
 
             t = T - states[0].remaining_timesteps
 
-            rng = jax.random.PRNGKey(0)
-
-            actor_states = [actor.init(rng, None) for actor in actors]
-
-            trajectories = [states[0]]
-
             for _ in range(t, T):
                 current_state = states[-1]
 
                 clean_state = strip_scenario_id(current_state)
-                outputs = []
-                new_actor_states = []
 
-                # outputs = [
-                #    jit_select_action({}, clean_state, None, None)
-                #    for jit_select_action in jit_select_action_list
-                # ]
+                outputs = [
+                    jit_select_action({}, clean_state, None, None)
+                    for jit_select_action in jit_select_action_list
+                ]
 
-                for i, jit_select_action in enumerate(jit_select_action_list):
-                    out = jit_select_action({}, clean_state, actor_states[i], None)
-                    outputs.append(out)
-                    new_actor_states.append(out.actor_state)
-
-                actor_states = new_actor_states
                 action = agents.merge_actions(outputs)
                 next_state = jit_step(clean_state, action)
-                trajectories.append(next_state)
-
-                if next_state.timestep < 55:
+                if next_state.timestep < 45:
                     states.append(next_state)
 
-                    #imgs = []
-                    #for state in states:
-                    #    imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-                    #with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_longtest.mp4', fps=10) as writer:
-                    #    for frame in imgs:
-                    #        writer.append_data(frame)
+                # imgs = []
+                # for state in states:
+                #    imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
+                # with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_longtest.mp4', fps=10) as writer:
+                #    for frame in imgs:
+                #        writer.append_data(frame)
 
             # calculate KPIs and store them !
-            # check whether collision occurred
+            # check whether collision occured
             collision, t_col, v_av, v_lead, delta_v = detect_collision(
                 states[-1].sim_trajectory,
                 av_idx=av_index,
@@ -377,7 +361,7 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
 
 
 for decel in decel_values:
-    out_csv = f'testing_davis_breakdown_decel_{decel:.3f}_0.25rt.csv'
+    out_csv = f'testing_IDM_breakdown_decel_{decel:.3f}_0.25rt.csv'
     KPIS_dict[decel].to_csv(out_csv)
     print(f"Saved results for decel={decel:.3f} to {out_csv}")
 

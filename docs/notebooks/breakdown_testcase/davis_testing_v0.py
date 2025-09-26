@@ -20,7 +20,6 @@ import pickle
 import tensorflow as tf
 from itertools import islice
 import pandas as pd
-import re
 
 def find_leading_vehicles(scenario):
     obj_types = scenario.object_metadata.object_types  # 1=vehicle, 2=pedestrian, 3=cyclist
@@ -101,6 +100,7 @@ def strip_scenario_id(state):
     )
     return dataclasses.replace(state, object_metadata=clean_metadata)
 
+
 def detect_collision(trajectory, av_idx, lead_idx):
     """
     Returns:
@@ -125,8 +125,7 @@ def detect_collision(trajectory, av_idx, lead_idx):
     diff = p_obj - p_av
     proj = np.einsum('ij,ij->i', diff, v_av_norm)
 
-    # jax.debug.print('proj:{}', proj[:45].min())
-
+    jax.debug.print('proj:{}', proj[:45].min())
     # Collision threshold
     collision_mask = (proj < (trajectory.length[av_index][0]/2 + trajectory.length[lead_idx][0]/2)) & (proj != 0)
 
@@ -146,8 +145,8 @@ def detect_collision(trajectory, av_idx, lead_idx):
         vx_lead = trajectory.vel_x[lead_idx, first_collision_timestep]
         vy_lead = trajectory.vel_y[lead_idx, first_collision_timestep]
 
-        speed_av_at_collision = float(jnp.sqrt(vx_av ** 2 + vy_av ** 2))
-        speed_lead_at_collision = float(jnp.sqrt(vx_lead ** 2 + vy_lead ** 2))
+        speed_av_at_collision = float(jnp.sqrt(vx_av**2 + vy_av**2))
+        speed_lead_at_collision = float(jnp.sqrt(vx_lead**2 + vy_lead**2))
         delta_v = abs(speed_av_at_collision - speed_lead_at_collision)
 
     return (
@@ -193,30 +192,10 @@ def compute_jerk(log_trajectory, veh_idx, dt=0.1):
 # Config dataset:
 max_num_objects = 32
 
-tfrecord_files = tf.io.gfile.glob(
-    "../../data/motion_v_1_3_0/uncompressed/tf_example/training/training_tfexample.tfrecord-*"
-)
-tfrecord_files = sorted(
-    tfrecord_files,
-    key=lambda x: int(re.search(r'tfrecord-(\d+)-of', x).group(1))
-)
-filtered_scenarios = [f[:-4] for f in os.listdir("../filtered_data") if f.endswith('.pkl')]
-decel_values = [-5.884, -4.903, -3.923]
+tfrecord_files = tf.io.gfile.glob("data/motion_v_1_3_0/uncompressed/tf_example/training2/training_tfexample.tfrecord-*")
+filtered_scenarios = [f[:-4] for f in os.listdir("docs/filtered_data") if f.endswith('.pkl')]
 
-# KPIS = pd.DataFrame(index=filtered_scenarios, columns=["col_outcome", "Vs_av", "Vs_lead", "delta_Vs", "jerk_av", "max_jerk_av", "mean_jerk_av"])
-KPIS_dict = {
-    decel: pd.DataFrame(
-        index=filtered_scenarios,
-        columns=["col_outcome", "Vs_av", "Vs_lead", "delta_Vs",
-                 "jerk_av", "max_jerk_av", "mean_jerk_av"]
-    )
-    for decel in decel_values
-}
-
-
-
-processed_scenarios = set()
-pending_scenarios = set(filtered_scenarios)
+KPIS = pd.DataFrame(index=filtered_scenarios, columns=["col_outcome", "Vs_av", "Vs_lead", "delta_Vs", "jerk_av", "max_jerk_av", "mean_jerk_av"])
 
 for shard_idx, shard_file in enumerate(tfrecord_files):
     
@@ -226,35 +205,37 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
         max_num_objects=max_num_objects
     )
     
-    all_counts = sum(1 for _ in tf.data.TFRecordDataset(shard_file))
+    all_counts = 0
+    for _ in tf.data.TFRecordDataset(shard_file):
+        all_counts += 1
     jax.debug.print("There are {} scenarios in {}", all_counts, shard_file.split('/')[-1])
 
     data_iter = dataloader.simulator_state_generator(config=config)
 
+    output_dir = "../processed_data"
+    os.makedirs(output_dir, exist_ok=True)
+
     for scenario_idx in range(all_counts):
         scenario = next(islice(data_iter, scenario_idx, scenario_idx+1))
         scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
-        if (scenario_id not in filtered_scenarios) or (scenario_id in processed_scenarios):
-            continue
-
         #jax.debug.print("Scenario id: {}", scenario_id)
+        if scenario_id == 'dddbf8db0b149f17':
+        #if (scenario_id in filtered_scenarios) and (KPIS.loc[scenario_id].isna().all()):
+            jax.debug.print("Scenario id found: {}", scenario_id)
+            is_sdc_mask = scenario.object_metadata.is_sdc
+            av_index = np.where(is_sdc_mask)[0][0]
+            leading_vehicles = find_leading_vehicles(scenario)
+            distances = []
+            for i in leading_vehicles:
+                dx = scenario.log_trajectory.x[i, :91] - scenario.log_trajectory.x[av_index, :91]
+                dy = scenario.log_trajectory.y[i, :91] - scenario.log_trajectory.y[av_index, :91]
+                dist = np.mean(np.sqrt(dx ** 2 + dy ** 2))
+                distances.append(dist)
+            leading_index = leading_vehicles[np.argmin(distances)]
 
-        jax.debug.print("Processing scenario: {}", scenario_id)
-        is_sdc_mask = scenario.object_metadata.is_sdc
-        av_index = np.where(is_sdc_mask)[0][0]
-        leading_vehicles = find_leading_vehicles(scenario)
-        distances = []
-        for i in leading_vehicles:
-            dx = scenario.log_trajectory.x[i, :91] - scenario.log_trajectory.x[av_index, :91]
-            dy = scenario.log_trajectory.y[i, :91] - scenario.log_trajectory.y[av_index, :91]
-            dist = np.mean(np.sqrt(dx ** 2 + dy ** 2))
-            distances.append(dist)
-        leading_index = leading_vehicles[np.argmin(distances)]
+            # Config the multi-agent environment:
+            init_steps = 11
 
-        # Config the multi-agent environment:
-        init_steps = 11
-
-        for decel in decel_values:
             dynamics_model = dynamics.StateDynamics()
 
             # Expect users to control all valid object in the scene.
@@ -266,13 +247,13 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
                     controlled_object=_config.ObjectType.VALID,
                 ),
             )
-
+            
             obj_idx = jnp.arange(max_num_objects)
 
             actor_0 = agents.create_constant_acceleration_actor(
                 dynamics_model=dynamics_model,
                 is_controlled_func=lambda state: obj_idx == leading_index,
-                acceleration=decel
+                acceleration=-5.884
             )
 
             actor_1 = agents.davis_actor(
@@ -281,17 +262,10 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
                 av_idx=av_index,
                 lead_idx=leading_index,
             )
-
+            
             #actor_1 = agents.IDMRoutePolicy(
             #    is_controlled_func=lambda state: obj_idx == av_index,
             #)
-
-            # actor_1 = agents.MPC_actor(
-            #     dynamics_model=dynamics_model,
-            #     is_controlled_func=lambda state: obj_idx == av_index,
-            #     av_idx=av_index,
-            #     lead_idx=leading_index,
-            # )
 
             # controls all the other vehicles.
             actor_2 = agents.create_expert_actor(
@@ -312,8 +286,8 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
 
             actor_states = [actor.init(rng, None) for actor in actors]
 
-            trajectories = [states[0]]
-
+            trajectories = [states[0]] 
+            
             for _ in range(t, T):
                 current_state = states[-1]
 
@@ -321,16 +295,15 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
                 outputs = []
                 new_actor_states = []
 
-                # outputs = [
+                #outputs = [
                 #    jit_select_action({}, clean_state, None, None)
                 #    for jit_select_action in jit_select_action_list
-                # ]
-
+                #]
                 for i, jit_select_action in enumerate(jit_select_action_list):
                     out = jit_select_action({}, clean_state, actor_states[i], None)
                     outputs.append(out)
                     new_actor_states.append(out.actor_state)
-
+                
                 actor_states = new_actor_states
                 action = agents.merge_actions(outputs)
                 next_state = jit_step(clean_state, action)
@@ -338,16 +311,16 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
 
                 if next_state.timestep < 55:
                     states.append(next_state)
-
-                    #imgs = []
-                    #for state in states:
-                    #    imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-                    #with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_longtest.mp4', fps=10) as writer:
-                    #    for frame in imgs:
-                    #        writer.append_data(frame)
-
+                
+                    imgs = []
+                    for state in states:
+                        imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
+                    with imageio.get_writer(f'docs/processed_data/{scenario_id}_davis_test.mp4', fps=10) as writer:
+                        for frame in imgs:
+                            writer.append_data(frame)
+                
             # calculate KPIs and store them !
-            # check whether collision occurred
+            # check whether collision occured
             collision, t_col, v_av, v_lead, delta_v = detect_collision(
                 states[-1].sim_trajectory,
                 av_idx=av_index,
@@ -356,34 +329,22 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
             if collision:
                 col_outcome = 0
                 Vs_av, Vs_lead, delta_Vs = [v_av, v_lead, delta_v]
-            else:
+            else:  
                 col_outcome = 1
                 Vs_av, Vs_lead, delta_Vs = [jnp.nan, jnp.nan, jnp.nan]
-
+            
             jerk_av, max_jerk_av, mean_jerk_av = compute_jerk(states[-1].log_trajectory, av_index)
 
-            KPIS_dict[decel].loc[scenario_id] = pd.Series({
-                'col_outcome': col_outcome,
-                'Vs_av': Vs_av,
-                'Vs_lead': Vs_lead,
-                'delta_Vs': delta_Vs,
-                'jerk_av': jerk_av,
-                'max_jerk_av': max_jerk_av,
-                'mean_jerk_av': mean_jerk_av
-            })
+            KPIS.loc[scenario_id] = pd.Series({'col_outcome':col_outcome, 
+                                           'Vs_av': Vs_av, 
+                                           'Vs_lead': Vs_lead, 
+                                           'delta_Vs': delta_Vs, 
+                                           'jerk_av': jerk_av, 
+                                           'max_jerk_av': max_jerk_av, 
+                                           'mean_jerk_av':mean_jerk_av})  
 
-            processed_scenarios.add(scenario_id)
-            pending_scenarios.discard(scenario_id)
+        else: 
+            continue
 
-
-for decel in decel_values:
-    out_csv = f'testing_davis_breakdown_decel_{decel:.3f}_0.25rt.csv'
-    KPIS_dict[decel].to_csv(out_csv)
-    print(f"Saved results for decel={decel:.3f} to {out_csv}")
-
-# 🔑 检查是否有没找到的 scenario
-if pending_scenarios:
-    print("⚠️ Warning: The following scenario_ids from filtered_scenarios were not found in any tfrecord:")
-    for sid in pending_scenarios:
-        print("  -", sid)
+KPIS.to_csv('docs/notebooks/testing_davis_breakdown_dry.csv')
 
