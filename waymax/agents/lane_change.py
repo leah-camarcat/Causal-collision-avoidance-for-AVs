@@ -12,7 +12,7 @@ def create_lane_change_actor(
     *,
     lane_width: float = 3.5,
     side: int = 1,          # +1 left, -1 right
-    duration_s: float = 3.0,
+    duration_s: float = 1.5,  # previously 3.0
 ):
     """Lane change actor that executes once and then maintains position in the new lane."""
     dt = datatypes.TIME_INTERVAL

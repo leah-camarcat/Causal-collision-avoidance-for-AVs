@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..",  "..", "..")))
 import dataclasses
 
 import jax
@@ -60,7 +60,7 @@ def find_leading_vehicles(scenario):
         longitudinal_dist = np.abs(proj)
 
         # 初步条件
-        valid_mask = (cos_angle > 0.9) & (lateral_dist < 0.5) & (proj > 0) & (longitudinal_dist >= 25)
+        valid_mask = (cos_angle > 0.9) & (lateral_dist < 0.5) & (proj > 0) & (longitudinal_dist <= 25)
 
         # 检查纵向距离递减连续段
         consecutive_count = 0
@@ -85,7 +85,7 @@ def find_leading_vehicles(scenario):
 def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
     obj_types = scenario.object_metadata.object_types
     vehicle_indices = [i for i in range(len(obj_types)) if obj_types[i] == 1 and i != av_index]
-    T = min(30, scenario.remaining_timesteps)
+    T = min(50, scenario.remaining_timesteps)
 
     # AV 轨迹
     x_av = scenario.log_trajectory.x[av_index, :T]
@@ -152,13 +152,15 @@ def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
         )
 
         if valid_mask.mean() > 0.3:
-            mean_dist = np.mean(proj[valid_mask])
+            mean_dist = np.min(proj[valid_mask])
+            print(i, mean_dist)
             if mean_dist < candidate_dist:
                 candidate = i
                 candidate_dist = mean_dist
                 candidate_side = side_mask
+                candidate_init_time = np.argmax(valid_mask==True)
 
-    return candidate, candidate_side
+    return candidate, candidate_side, candidate_init_time
 
 
 def strip_scenario_id(state):
@@ -190,13 +192,15 @@ for scenario_idx, scenario in enumerate(data_iter):
     scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
     #if scenario_id == '1fb44c31801c956d':
     #if scenario_id == '5130b590379b4722':
-    #if scenario_id == '1ba54b48c61a6e1b':
-    if scenario_id == '10f5ea040a3e4acd':
+    #if scenario_id == '13287b3964f36896': # next
+    if scenario_id == '147796b36ec1ddad':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         leading_vehicles_results = find_adjacent_vehicle(scenario, av_index)
         leading_index = leading_vehicles_results[0]
-        jax.debug.print('leading_index:{}', leading_index)
+        lv = find_leading_vehicles(scenario)
+        jax.debug.print('leading adj index:{}', leading_index)
+        jax.debug.print('leading index:{}', lv)
         #distances = []
         #for i in leading_vehicles:
         #    dx = scenario.log_trajectory.x[i, :91] - scenario.log_trajectory.x[av_index, :91]
@@ -211,7 +215,7 @@ for scenario_idx, scenario in enumerate(data_iter):
 #jax.debug.print("initial timestep={} for vehicle id: {}", init_steps, leading_index)
 #side = leading_vehicles_results[np.argmin(distances), 2]
 lead_side = leading_vehicles_results[1]
-init_steps = 11
+init_steps = leading_vehicles_results[2]
 dynamics_model = dynamics.StateDynamics()
 
 # Expect users to control all valid object in the scene.
@@ -231,7 +235,8 @@ obj_idx = jnp.arange(max_num_objects)
 actor_0 = agents.create_lane_change_actor(
     dynamics_model=dynamics_model,
     is_controlled_func=lambda state: obj_idx == leading_index,
-    side = lead_side
+    side = lead_side,
+    #init_time = init_steps
 )
 
 # IDM actor/policy controlling both object 0 and 1.
