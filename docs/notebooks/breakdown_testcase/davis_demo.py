@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..","..", "..")))
 import dataclasses
 
 import jax
@@ -249,9 +249,9 @@ actor_0 = agents.create_constant_acceleration_actor(
 
 # IDM actor/policy controlling both object 0 and 1.
 # Note IDM policy is an actor hard-coded to use dynamics.StateDynamics().
-#actor_1 = agents.IDMRoutePolicy(
-#    is_controlled_func=lambda state: obj_idx == av_index
-#)
+actor_1 = agents.IDMRoutePolicy(
+    is_controlled_func=lambda state: obj_idx == av_index
+)
 
 #actor_1 = agents.MPC_actor(
 #    dynamics_model=dynamics_model,
@@ -260,12 +260,12 @@ actor_0 = agents.create_constant_acceleration_actor(
 #    lead_idx=leading_index,
 #)
 
-actor_1 = agents.davis_actor(
-    dynamics_model=dynamics_model,
-    is_controlled_func=lambda state: obj_idx == av_index,
-    av_idx=av_index,
-    lead_idx=leading_index,
-)
+#actor_1 = agents.davis_actor(
+#    dynamics_model=dynamics_model,
+#    is_controlled_func=lambda state: obj_idx == av_index,
+#    av_idx=av_index,
+#    lead_idx=leading_index,
+#)
 
 # controls all the other vehicles.
 actor_2 = agents.create_expert_actor(
@@ -317,7 +317,7 @@ for _ in range(t, T):
   next_state = jit_step(clean_state, action)
   trajectories.append(next_state)
 
-  if next_state.timestep < 55:
+  if next_state.timestep < 65:
 
     states.append(next_state)
 
@@ -333,7 +333,7 @@ for _ in range(t, T):
     imgs = []
     for state in states:
         imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-    with imageio.get_writer(f'docs/processed_data/{scenario_id}_davis_R.mp4', fps=10) as writer:
+    with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_Rtrigg.mp4', fps=10) as writer:
         for frame in imgs:
             writer.append_data(frame)
 

@@ -53,7 +53,7 @@ class SimAgentActor(actor_core.WaymaxActorCore):
 
   @abc.abstractmethod
   def update_trajectory(
-      self, state: datatypes.SimulatorState
+      self, state: datatypes.SimulatorState, actor_state: Any,
   ) -> datatypes.TrajectoryUpdate:
     """Updates the trajectory for all simulated agents.
 
@@ -87,11 +87,12 @@ class SimAgentActor(actor_core.WaymaxActorCore):
     Returns:
       An actor output containing the next action and actor state.
     """
-    del params, actor_state, rng  # Unused.
-    action = self.update_trajectory(state).as_action()
+    del params, rng  # Unused.
+    action, actor_state = self.update_trajectory(state, actor_state)
+    action = action.as_action()
     return actor_core.WaymaxActorOutput(
         action=action,
-        actor_state=None,
+        actor_state=actor_state,
         is_controlled=self.is_controlled_func(state),
     )
 

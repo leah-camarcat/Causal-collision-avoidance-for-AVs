@@ -96,7 +96,8 @@ def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
     p_av = np.stack([x_av, y_av], axis=-1)
     v_av_norm = v_av / (np.linalg.norm(v_av, axis=1, keepdims=True) + 1e-6)
     speed_av = np.linalg.norm(v_av, axis=1)
-
+    length_av = scenario.log_trajectory.length[av_index][0]
+    
     if leading_vehicle is not None:
         vx_l = scenario.log_trajectory.vel_x[leading_vehicle, :T]
         vy_l = scenario.log_trajectory.vel_y[leading_vehicle, :T]
@@ -148,7 +149,7 @@ def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
                 (cos_angle > 0.98) &
                 (speed_obj >= speed_av) &
                 (speed_obj <= speed_l) &
-                (proj >= 10) & (proj < 25)
+                (proj >= 7) & (proj < 25)
         )
 
         if valid_mask.mean() > 0.3:
@@ -193,7 +194,7 @@ for scenario_idx, scenario in enumerate(data_iter):
     #if scenario_id == '1fb44c31801c956d':
     #if scenario_id == '5130b590379b4722':
     #if scenario_id == '13287b3964f36896': # next
-    if scenario_id == '147796b36ec1ddad':
+    if scenario_id == 'a386ed131200aec9':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         leading_vehicles_results = find_adjacent_vehicle(scenario, av_index)
@@ -212,10 +213,11 @@ for scenario_idx, scenario in enumerate(data_iter):
 
 # Config the multi-agent environment:
 #init_steps = leading_vehicles_results[np.argmin(distances), 1]
-#jax.debug.print("initial timestep={} for vehicle id: {}", init_steps, leading_index)
 #side = leading_vehicles_results[np.argmin(distances), 2]
 lead_side = leading_vehicles_results[1]
-init_steps = leading_vehicles_results[2]
+init_steps = 11
+init_lanechange = leading_vehicles_results[2]
+jax.debug.print("initial timestep={} for vehicle id: {}", init_lanechange, leading_index)
 dynamics_model = dynamics.StateDynamics()
 
 # Expect users to control all valid object in the scene.
@@ -236,7 +238,8 @@ actor_0 = agents.create_lane_change_actor(
     dynamics_model=dynamics_model,
     is_controlled_func=lambda state: obj_idx == leading_index,
     side = lead_side,
-    #init_time = init_steps
+    duration_s = 1.78,
+    init_step = init_lanechange, 
 )
 
 # IDM actor/policy controlling both object 0 and 1.
@@ -246,19 +249,19 @@ actor_0 = agents.create_lane_change_actor(
 #    is_controlled_func=lambda state: obj_idx == av_index
 #)
 
-actor_1 = agents.MPC_2D_actor(
-    dynamics_model=dynamics_model,
-    is_controlled_func=lambda state: obj_idx == av_index,
-    av_idx=av_index,
-    obs_idx=leading_index,
-)
-
-#actor_1 = agents.MPC_actor(
+#actor_1 = agents.MPC_2D_actor(
 #    dynamics_model=dynamics_model,
 #    is_controlled_func=lambda state: obj_idx == av_index,
 #    av_idx=av_index,
-#    lead_idx=leading_index,
+#    obs_idx=leading_index,
 #)
+
+actor_1 = agents.causal_ellipse_actor(
+    dynamics_model=dynamics_model,
+    is_controlled_func=lambda state: obj_idx == av_index,
+    av_idx=av_index,
+    neigh_idx=leading_index,
+)
 
 actors = [actor_0, actor_1]  # include all the vehicles you want to change
 jit_step = jax.jit(env.step)
@@ -291,14 +294,14 @@ for _ in range(t, T):
     action = agents.merge_actions(outputs)
     next_state = jit_step(clean_state, action)
 
-    if next_state.timestep < 55:
+    if next_state.timestep < 65:
 
         states.append(next_state)
 
         imgs = []
         for state in states:
             imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-        with imageio.get_writer(f'docs/processed_data/{scenario_id}_MPC2d_lanechange.mp4', fps=10) as writer:
+        with imageio.get_writer(f'docs/processed_data/{scenario_id}_causal_lanechange.mp4', fps=10) as writer:
             for frame in imgs:
                 writer.append_data(frame)
     else:

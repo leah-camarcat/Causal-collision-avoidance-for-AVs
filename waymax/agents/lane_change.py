@@ -12,7 +12,8 @@ def create_lane_change_actor(
     *,
     lane_width: float = 3.5,
     side: int = 1,          # +1 left, -1 right
-    duration_s: float = 1.5,  # previously 3.0
+    duration_s: float = 3.5,  # previously 3.0
+    init_step: int = 11.0,
 ):
     """Lane change actor that executes once and then maintains position in the new lane."""
     dt = datatypes.TIME_INTERVAL
@@ -51,56 +52,77 @@ def create_lane_change_actor(
         heading = vel / speed
         lateral = jnp.stack([-heading[..., 1], heading[..., 0]], axis=-1)
 
-        # check whether we need to start
-        in_progress = actor_state["in_progress"]
-        done = actor_state["done"]
-        start = jnp.logical_and(is_controlled, jnp.logical_not(in_progress) & jnp.logical_not(done))
+        if_not_started = state.timestep < init_step.astype(jnp.int32)
+        
+        def before_start():
+            #actions = dynamics_model.inverse(traj_t0, state.object_metadata, timestep=0)
+            batch_shape = is_controlled.shape
+            log_traj = datatypes.dynamic_index(
+                state.log_trajectory, state.timestep, axis=-1, keepdims=True
+            )
+            actions = dynamics_model.inverse(log_traj, state.object_metadata, timestep=0)
+            new_actor_state = {
+                "in_progress": jnp.broadcast_to(actor_state["in_progress"], batch_shape),
+                "elapsed": jnp.broadcast_to(actor_state["elapsed"], batch_shape),
+                "lateral_progress": jnp.broadcast_to(actor_state["lateral_progress"], batch_shape),
+                "total_shift": jnp.broadcast_to(actor_state["total_shift"], batch_shape),
+                "done": jnp.broadcast_to(actor_state["done"], batch_shape),
+            }
+            return actions, new_actor_state
+        
+        def after_start(): 
+            # --- after init_time: run lane-change logic ---
+            in_progress = actor_state["in_progress"]
+            done = actor_state["done"]
+            start = jnp.logical_and(is_controlled, jnp.logical_not(in_progress) & jnp.logical_not(done))
 
-        total_shift = jnp.where(start, side * lane_width, actor_state["total_shift"])
-        in_progress = jnp.logical_or(in_progress, start)
-        elapsed = jnp.where(start, 0.0, actor_state["elapsed"] + dt)
+            total_shift = jnp.where(start, side * lane_width, actor_state["total_shift"])
+            in_progress = jnp.logical_or(in_progress, start)
+            elapsed = jnp.where(start, 0.0, actor_state["elapsed"] + dt)
 
-        # compute lateral shift progress
-        s_now = smooth_s(elapsed, duration_s)
-        target_shift = total_shift * s_now
+            # compute lateral shift progress
+            s_now = smooth_s(elapsed, duration_s)
+            target_shift = total_shift * s_now
 
-        delta_shift = target_shift - actor_state["lateral_progress"]
-        lateral_progress = actor_state["lateral_progress"] + delta_shift
+            delta_shift = target_shift - actor_state["lateral_progress"]
+            lateral_progress = actor_state["lateral_progress"] + delta_shift
 
-        # compute forward + lateral displacement
-        forward_pos = pos + heading * speed[..., 0:1] * dt
-        desired_pos = forward_pos + lateral * delta_shift[..., None]
-        desired_vel = heading * speed  # 保持纵向速度不变
+            # compute forward + lateral displacement
+            forward_pos = pos + heading * speed[..., 0:1] * dt
+            desired_pos = forward_pos + lateral * delta_shift[..., None]
+            desired_vel = heading * speed  # 保持纵向速度不变
 
-        # check if maneuver finished
-        finished = elapsed >= duration_s
-        in_progress = jnp.where(finished, False, in_progress)
-        elapsed = jnp.where(finished, actor_state["elapsed"], elapsed)
-        lateral_progress = jnp.where(finished, total_shift, lateral_progress)
-        done = jnp.logical_or(done, finished)
+            # check if maneuver finished
+            finished = elapsed >= duration_s
+            in_progress = jnp.where(finished, False, in_progress)
+            elapsed = jnp.where(finished, actor_state["elapsed"], elapsed)
+            lateral_progress = jnp.where(finished, total_shift, lateral_progress)
+            done = jnp.logical_or(done, finished)
 
-        traj_t1 = traj_t0.replace(
-            x=desired_pos[..., 0][..., None],
-            y=desired_pos[..., 1][..., None],
-            vel_x=desired_vel[..., 0][..., None],
-            vel_y=desired_vel[..., 1][..., None],
-            valid=is_controlled[..., None] & traj_t0.valid,
-            timestamp_micros=(traj_t0.timestamp_micros + datatypes.TIMESTEP_MICROS_INTERVAL),
-        )
+            traj_t1 = traj_t0.replace(
+                x=desired_pos[..., 0][..., None],
+                y=desired_pos[..., 1][..., None],
+                vel_x=desired_vel[..., 0][..., None],
+                vel_y=desired_vel[..., 1][..., None],
+                valid=is_controlled[..., None] & traj_t0.valid,
+                timestamp_micros=(traj_t0.timestamp_micros + datatypes.TIMESTEP_MICROS_INTERVAL),
+            )
 
-        traj_combined = jax.tree_util.tree_map(
-            lambda a, b: jnp.concatenate([a, b], axis=-1), traj_t0, traj_t1
-        )
-        actions = dynamics_model.inverse(traj_combined, state.object_metadata, timestep=0)
+            traj_combined = jax.tree_util.tree_map(
+                lambda a, b: jnp.concatenate([a, b], axis=-1), traj_t0, traj_t1
+            )
+            actions = dynamics_model.inverse(traj_combined, state.object_metadata, timestep=0)
 
-        new_actor_state = {
-            "in_progress": in_progress,
-            "elapsed": elapsed,
-            "lateral_progress": lateral_progress,
-            "total_shift": total_shift,
-            "done": done,
-        }
-
+            new_actor_state = {
+                "in_progress": in_progress,
+                "elapsed": elapsed,
+                "lateral_progress": lateral_progress,
+                "total_shift": total_shift,
+                "done": done,
+            }
+            return actions, new_actor_state
+        
+        actions, new_actor_state = jax.lax.cond(if_not_started, before_start, after_start)
         return actor_core.WaymaxActorOutput(
             actor_state=new_actor_state, action=actions, is_controlled=is_controlled
         )
