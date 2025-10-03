@@ -29,6 +29,7 @@ data/
         └── tf_example/
             └── training/
 ---
+```
 
 ## Installation
 
@@ -42,4 +43,4 @@ cd Causal-collision-avoidance-for-AVs
 # Install required Python packages
 pip install -r requirements.txt
 
-
+```
