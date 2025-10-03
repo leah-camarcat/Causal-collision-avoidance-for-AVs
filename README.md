@@ -9,12 +9,14 @@ This repository contains code and experiments for a **structural causal model (S
 ---
 
 ## Features
-- Makes use of Waymo example tfrecord and the corresponding Waymax simulator
+- Makes use of Waymo example tfrecord data and the corresponding Waymax simulator
 - Simulation of selected scenarios
 - Safety monitoring module providing actionable recommendations:
   - Acceleration / deceleration
   - Swerving / lane adjustment
-
+- Two test cases are implemented: 
+  - Sudden braking of the leading vehicle
+  - Sudden close cut in of a leading adjacent vehicle
 ---
 
 ## Installation
