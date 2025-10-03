@@ -20,13 +20,15 @@ This repository contains code and experiments for a **structural causal model (S
 ---
 
 ## Data download
-- We use Waymo data, please visit their website to download the tfrecords
-- Please use this file structure to store the tfrecord files: 
-  |- data
-    |- motion_v_1_3_0
-      |- uncompressed
-        |- tf_example
-          |- training
+- We use Waymo data; please visit their website to download the tfrecords.
+- Please use the following file structure to store the tfrecord files:
+```text
+data/
+└── motion_v_1_3_0/
+    └── uncompressed/
+        └── tf_example/
+            └── training/
+---
 
 ## Installation
 
