@@ -4,7 +4,7 @@
 This repository contains code and experiments for a **structural causal model (SCM)** used to avoid collisions in autonomous driving. The model uses counterfactual reasoning to decide which emergency evasive manoeuvre to take. Several versions of SCMs are implemented with the idea of safety distance to estimate the imminent collision outcome: 
 - 1D deterministic SCM (longitudinal collision avoidance) 
 - 2D deterministic SCM (longitudinal and lateral collision avoidance)
-- 2D learned SCM (longitudinal and lateral collision avoidance)
+- 2D AI-based SCM (longitudinal and lateral collision avoidance)
 
 ---
 
@@ -28,7 +28,6 @@ data/
     └── uncompressed/
         └── tf_example/
             └── training/
----
 ```
 
 ## Installation
