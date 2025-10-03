@@ -181,6 +181,64 @@ def strip_scenario_id(state):
     return dataclasses.replace(state, object_metadata=clean_metadata)
 
 
+def detect_collision(trajectory, av_idx, lead_idx):
+    """
+    Returns:
+        collision_happened (bool),
+        first_collision_timestep (int or None),
+        speed_av_at_collision (float or None),
+        speed_lead_at_collision (float or None),
+        delta_v (float or None)
+    """
+    # Extract positions across timesteps
+    x_av, y_av = trajectory.x[av_idx], trajectory.y[av_idx]
+    x_lead, y_lead = trajectory.x[lead_idx], trajectory.y[lead_idx]
+    vx_av = trajectory.vel_x[av_index]
+    vy_av = trajectory.vel_y[av_index]
+    v_av = np.stack([vx_av, vy_av], axis=-1)
+    # Euclidean distance
+    # dist = jnp.sqrt((x_av - x_lead)**2 + (y_av - y_lead)**2)
+    p_av = np.stack([x_av, y_av], axis=-1)
+    p_obj = np.stack([x_lead, y_lead], axis=-1)
+
+    v_av_norm = v_av / (np.linalg.norm(v_av, axis=1, keepdims=True) + 1e-6)
+    diff = p_obj - p_av
+    proj = np.einsum('ij,ij->i', diff, v_av_norm)
+    cross = np.abs(diff[:, 0] * v_av[:, 1] - diff[:, 1] * v_av[:, 0])
+    lateral_dist = cross / (np.linalg.norm(v_av, axis=1) + 1e-6)
+
+    # Collision threshold
+    collision_mask = (proj < (trajectory.length[av_index][0]/2 + trajectory.length[lead_idx][0]/2)) & (proj != 0) & (lateral_dist < 0.5)
+
+    collision_happened = bool(jnp.any(collision_mask))
+    first_collision_timestep = None
+    speed_av_at_collision = None
+    speed_lead_at_collision = None
+    delta_v = None
+
+    if collision_happened:
+        # timestep of first collision
+        first_collision_timestep = int(jnp.argmax(collision_mask))
+
+        # Speeds at collision timestep
+        vx_av = trajectory.vel_x[av_idx, first_collision_timestep]
+        vy_av = trajectory.vel_y[av_idx, first_collision_timestep]
+        vx_lead = trajectory.vel_x[lead_idx, first_collision_timestep]
+        vy_lead = trajectory.vel_y[lead_idx, first_collision_timestep]
+
+        speed_av_at_collision = float(jnp.sqrt(vx_av ** 2 + vy_av ** 2))
+        speed_lead_at_collision = float(jnp.sqrt(vx_lead ** 2 + vy_lead ** 2))
+        delta_v = abs(speed_av_at_collision - speed_lead_at_collision)
+
+    return (
+        collision_happened,
+        first_collision_timestep,
+        speed_av_at_collision,
+        speed_lead_at_collision,
+        delta_v,
+    )
+
+
 # Config dataset:
 max_num_objects = 32
 
@@ -194,7 +252,7 @@ for scenario_idx, scenario in enumerate(data_iter):
     #if scenario_id == '1fb44c31801c956d':
     #if scenario_id == '5130b590379b4722':
     #if scenario_id == '13287b3964f36896': # next
-    if scenario_id == 'a386ed131200aec9':
+    if scenario_id == '6aae01a90f47b2b0':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         leading_vehicles_results = find_adjacent_vehicle(scenario, av_index)
@@ -256,11 +314,17 @@ actor_0 = agents.create_lane_change_actor(
 #    obs_idx=leading_index,
 #)
 
-actor_1 = agents.causal_ellipse_actor(
+#actor_1 = agents.causal_ellipse_actor(
+#    dynamics_model=dynamics_model,
+#    is_controlled_func=lambda state: obj_idx == av_index,
+#    av_idx=av_index,
+#    neigh_idx=leading_index,
+#)
+
+actor_1 = agents.causal_cnn_actor(
     dynamics_model=dynamics_model,
     is_controlled_func=lambda state: obj_idx == av_index,
     av_idx=av_index,
-    neigh_idx=leading_index,
 )
 
 actors = [actor_0, actor_1]  # include all the vehicles you want to change
@@ -306,7 +370,14 @@ for _ in range(t, T):
                 writer.append_data(frame)
     else:
         break
-    
+
+collision, t_col, v_av, v_lead, delta_v = detect_collision(
+            states[-1].sim_trajectory,
+            av_idx=av_index,
+            lead_idx=leading_index,
+        )
+
+jax.debug.print("collision outcome: {}", collision) 
 
 # with open(f"../processed_data/{scenario_id}_m.pkl", "wb") as f:
 #     pickle.dump(tensor, f)
