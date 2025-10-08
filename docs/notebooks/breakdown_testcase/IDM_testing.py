@@ -361,7 +361,7 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
 
 
 for decel in decel_values:
-    out_csv = f'testing_IDM_breakdown_decel_{decel:.3f}_0.25rt.csv'
+    out_csv = f'testing_IDM_breakdown_decel_{decel:.3f}_v2.csv'
     KPIS_dict[decel].to_csv(out_csv)
     print(f"Saved results for decel={decel:.3f} to {out_csv}")
 

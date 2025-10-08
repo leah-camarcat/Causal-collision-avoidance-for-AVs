@@ -23,13 +23,14 @@ from itertools import islice
 import pandas as pd
 import re
 
+
 def find_leading_vehicles(scenario):
     obj_types = scenario.object_metadata.object_types  # 1=vehicle, 2=pedestrian, 3=cyclist
     other_vehicle_indices = [i for i in range(len(obj_types))
                              if i != av_index and obj_types[i] == 1]
 
     leading_vehicles = []
-    T = min(30, scenario.remaining_timesteps)
+    T = min(50, scenario.remaining_timesteps)
 
     x_av = scenario.log_trajectory.x[av_index, :T]
     y_av = scenario.log_trajectory.y[av_index, :T]
@@ -64,7 +65,7 @@ def find_leading_vehicles(scenario):
         longitudinal_dist = np.abs(proj)
 
         # 初步条件
-        valid_mask = (cos_angle > 0.9) & (lateral_dist < 0.5) & (proj > 0) & (longitudinal_dist <= 25)
+        valid_mask = (cos_angle > 0.9) & (lateral_dist < 0.5) & (proj > 0)
 
         # 检查纵向距离递减连续段
         consecutive_count = 0
@@ -101,7 +102,7 @@ def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
     v_av_norm = v_av / (np.linalg.norm(v_av, axis=1, keepdims=True) + 1e-6)
     speed_av = np.linalg.norm(v_av, axis=1)
     length_av = scenario.log_trajectory.length[av_index][0]
-    
+
     if leading_vehicle is not None:
         vx_l = scenario.log_trajectory.vel_x[leading_vehicle, :T]
         vy_l = scenario.log_trajectory.vel_y[leading_vehicle, :T]
@@ -153,17 +154,17 @@ def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
                 (cos_angle > 0.98) &
                 (speed_obj >= speed_av) &
                 (speed_obj <= speed_l) &
-                (proj >= 7) & (proj < 25)
+                (proj >= 5) & (proj <= 10)
         )
 
         if valid_mask.mean() > 0.3:
             mean_dist = np.min(proj[valid_mask])
-            print(i, mean_dist)
+            # print(i, mean_dist)
             if mean_dist < candidate_dist:
                 candidate = i
                 candidate_dist = mean_dist
                 candidate_side = side_mask
-                candidate_init_time = np.argmax(valid_mask==True)
+                candidate_init_time = np.argmax(valid_mask == True)
 
     return candidate, candidate_side, candidate_init_time
 
@@ -211,8 +212,11 @@ def detect_collision(trajectory, av_idx, lead_idx):
 
     # jax.debug.print('proj:{}', proj[:45].min())
 
+    cross = np.abs(diff[:, 0] * v_av[:, 1] - diff[:, 1] * v_av[:, 0])
+    lateral_dist = cross / (np.linalg.norm(v_av, axis=1) + 1e-6)
     # Collision threshold
-    collision_mask = (proj < (trajectory.length[av_index][0]/2 + trajectory.length[lead_idx][0]/2)) & (proj != 0)
+    collision_mask = (proj < (trajectory.length[av_index][0] / 2 + trajectory.length[lead_idx][0] / 2)) & (
+            proj != 0) & (lateral_dist < 0.5)
 
     collision_happened = bool(jnp.any(collision_mask))
     first_collision_timestep = None
@@ -324,7 +328,7 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
         jax.debug.print("Processing scenario: {}", scenario_id)
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
-        
+
         leading_vehicles_results = find_adjacent_vehicle(scenario, av_index)
         leading_index = leading_vehicles_results[0]
         lead_side = leading_vehicles_results[1]
@@ -350,11 +354,10 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
             actor_0 = agents.create_lane_change_actor(
                 dynamics_model=dynamics_model,
                 is_controlled_func=lambda state: obj_idx == leading_index,
-                side = lead_side,
-                duration_s = lcduration,
-                init_step = init_lanechange, 
+                side=lead_side,
+                duration_s=lcduration,
+                init_step=init_lanechange,
             )
-
 
             actor_1 = agents.MPC_2D_actor(
                 dynamics_model=dynamics_model,
@@ -446,7 +449,7 @@ for shard_idx, shard_file in enumerate(tfrecord_files):
             pending_scenarios.discard(scenario_id)
 
 for lcduration in lane_change_values:
-    out_csv = f'testing_MPC_breakdown_decel_{lcduration:.3f}_0.25rt.csv'
+    out_csv = f'testing_MPC_cutin_dur_{lcduration:.3f}.csv'
     KPIS_dict[lcduration].to_csv(out_csv)
     print(f"Saved results for decel={lcduration:.3f} to {out_csv}")
 
