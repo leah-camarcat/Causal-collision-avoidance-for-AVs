@@ -191,7 +191,7 @@ for scenario_idx, scenario in enumerate(data_iter):
     scenario_id = scenario.object_metadata.scenario_id[0].decode('utf-8')
     #if scenario_id == '1fb44c31801c956d':
     #if scenario_id == 'cd7a6be74ecc125a':
-    if scenario_id == 'ada30f16b8df13c4':
+    if scenario_id == 'dddbf8db0b149f17':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         leading_vehicles = find_leading_vehicles(scenario)
@@ -333,7 +333,7 @@ for _ in range(t, T):
     imgs = []
     for state in states:
         imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-    with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_Rtrigg.mp4', fps=10) as writer:
+    with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_Rtrigg1_5.mp4', fps=10) as writer:
         for frame in imgs:
             writer.append_data(frame)
 

@@ -17,7 +17,8 @@ from waymax import env as _env
 from waymax import visualization
 import imageio
 import pickle
-
+from waymax.agents.causal_cnn.visualisation import plot_simulator_state_with_risk, visualize_risk_grid_overlay
+import matplotlib.pyplot as plt
 
 def find_leading_vehicles(scenario):
     obj_types = scenario.object_metadata.object_types  # 1=vehicle, 2=pedestrian, 3=cyclist
@@ -154,7 +155,6 @@ def find_adjacent_vehicle(scenario, av_index, leading_vehicle=None):
 
         if valid_mask.mean() > 0.3:
             mean_dist = np.min(proj[valid_mask])
-            print(i, mean_dist)
             if mean_dist < candidate_dist:
                 candidate = i
                 candidate_dist = mean_dist
@@ -252,7 +252,7 @@ for scenario_idx, scenario in enumerate(data_iter):
     #if scenario_id == '1fb44c31801c956d':
     #if scenario_id == '5130b590379b4722':
     #if scenario_id == '13287b3964f36896': # next
-    if scenario_id == '6aae01a90f47b2b0':
+    if scenario_id == '2c400bc9f9994564':
         is_sdc_mask = scenario.object_metadata.is_sdc
         av_index = np.where(is_sdc_mask)[0][0]
         leading_vehicles_results = find_adjacent_vehicle(scenario, av_index)
@@ -302,10 +302,9 @@ actor_0 = agents.create_lane_change_actor(
 
 # IDM actor/policy controlling both object 0 and 1.
 # Note IDM policy is an actor hard-coded to use dynamics.StateDynamics().
-#actor_1 = agents.IDMRoutePolicy(
-    #is_controlled_func=lambda state: (obj_idx == 0) | (obj_idx == 1)
-#    is_controlled_func=lambda state: obj_idx == av_index
-#)
+actor_1 = agents.IDMRoutePolicy(
+    is_controlled_func=lambda state: obj_idx == av_index
+)
 
 #actor_1 = agents.MPC_2D_actor(
 #    dynamics_model=dynamics_model,
@@ -321,11 +320,11 @@ actor_0 = agents.create_lane_change_actor(
 #    neigh_idx=leading_index,
 #)
 
-actor_1 = agents.causal_cnn_actor(
-    dynamics_model=dynamics_model,
-    is_controlled_func=lambda state: obj_idx == av_index,
-    av_idx=av_index,
-)
+#actor_1 = agents.causal_cnn_actor(
+#    dynamics_model=dynamics_model,
+#    is_controlled_func=lambda state: obj_idx == av_index,
+#    av_idx=av_index,
+#)
 
 actors = [actor_0, actor_1]  # include all the vehicles you want to change
 jit_step = jax.jit(env.step)
@@ -365,7 +364,9 @@ for _ in range(t, T):
         imgs = []
         for state in states:
             imgs.append(visualization.plot_simulator_state(state, use_log_traj=False))
-        with imageio.get_writer(f'docs/processed_data/{scenario_id}_causal_lanechange.mp4', fps=10) as writer:
+            visualize_risk_grid_overlay(state, av_index)
+            #imgs.append(plot_simulator_state_with_risk(state=state, ego_idx=av_index))
+        with imageio.get_writer(f'docs/processed_data/{scenario_id}_IDM_lanechange.mp4', fps=10) as writer:
             for frame in imgs:
                 writer.append_data(frame)
     else:

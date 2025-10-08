@@ -217,14 +217,14 @@ class IDMRoutePolicy(WaypointFollowingPolicy):
         is_controlled_func: Optional[Callable[[datatypes.SimulatorState], jax.Array]] = None,
         desired_vel: float = 30.0,
         min_spacing: float = 2.0,
-        safe_time_headway: float = 2.0,
+        safe_time_headway: float = 1.5,
         max_accel: float = 2.0,
-        max_decel: float = 4.0,
+        max_decel: float = 3.0,
         delta: float = 4.0,
-        max_lookahead: int = 10,
+        max_lookahead: int = 2,
         lookahead_from_current_position: bool = True,
-        additional_lookahead_points: int = 10,
-        additional_lookahead_distance: float = 10.0,
+        additional_lookahead_points: int = 2,
+        additional_lookahead_distance: float = 5.0,
         invalidate_on_end: bool = False,
         reaction_delay: float = 0.25,
     ):
@@ -274,7 +274,7 @@ class IDMRoutePolicy(WaypointFollowingPolicy):
         # Get current brake flag for AV
         brake_flags = actor_state["brake_flag"]
         av_brake_flag = brake_flags[av_index]
-        jax.debug.print('brake flag prev: {}', brake_flags[av_index])
+        #jax.debug.print('brake flag prev: {}', brake_flags[av_index])
         
         # Only check time headway if brake hasn't been activated yet
         # If already True, keep it True
@@ -282,7 +282,7 @@ class IDMRoutePolicy(WaypointFollowingPolicy):
             av_brake_flag,  # If already braking
             True,  # Keep it True
             self._check_time_headway(  # Otherwise check headway
-                state.current_sim_trajectory, av_index, lead_index, threshold=2.0
+                state.current_sim_trajectory, av_index, lead_index, threshold=1.5
             )
         )
         
@@ -292,7 +292,7 @@ class IDMRoutePolicy(WaypointFollowingPolicy):
         # Get the brake decision for this timestep
         should_brake = brake_flags[av_index]
         
-        jax.debug.print('should brake: {}', should_brake)
+        #jax.debug.print('should brake: {}', should_brake)
 
         # Compute acceleration using the delayed log trajectory
         accel = self._get_accel(
