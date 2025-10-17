@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 from waymax import datatypes
 import numpy as np 
-
+import pickle
 # ============================================================================
 # MTTC-BASED GROUND TRUTH RISK GRID
 # ============================================================================
@@ -18,6 +18,7 @@ import numpy as np
 def compute_mttc_vectorized(
     state: datatypes.SimulatorState,
     ego_idx: int,
+    time: int, 
     max_timesteps: int = 91,
     critical_ttc: float = 1,
     safe_ttc: float = 5.0
@@ -46,12 +47,21 @@ def compute_mttc_vectorized(
     
     lengths_all = state.log_trajectory.length
     widths_all = state.log_trajectory.width
-
+    sid = str(state.object_metadata.scenario_id)
+    sid = sid[3:-2]
+    filename = 'docs/cutin_filtered_data/' + str(sid) + '_modified.pkl'
+    with open(filename, 'rb') as f:
+        simulated_state = pickle.load(f)
+    
     # === GET EGO TRAJECTORY ===
-    x_ego = jnp.where(time_mask, state.log_trajectory.x[ego_idx, :], 0.0)
-    y_ego = jnp.where(time_mask, state.log_trajectory.y[ego_idx, :], 0.0)
-    vx_ego = jnp.where(time_mask, state.log_trajectory.vel_x[ego_idx, :], 0.0)
-    vy_ego = jnp.where(time_mask, state.log_trajectory.vel_y[ego_idx, :], 0.0)
+    x_ego = simulated_state[ego_idx, 0, :]
+    y_ego = simulated_state[ego_idx, 1, :]
+    vx_ego = simulated_state[ego_idx, 2, :]
+    vy_ego = simulated_state[ego_idx, 3, :]
+    #x_ego = jnp.where(time_mask, state.log_trajectory.x[ego_idx, :], 0.0)
+    #y_ego = jnp.where(time_mask, state.log_trajectory.y[ego_idx, :], 0.0)
+    #vx_ego = jnp.where(time_mask, state.log_trajectory.vel_x[ego_idx, :], 0.0)
+    #vy_ego = jnp.where(time_mask, state.log_trajectory.vel_y[ego_idx, :], 0.0)
     
     v_ego = jnp.stack([vx_ego, vy_ego], axis=-1)  # (T, 2)
     p_ego = jnp.stack([x_ego, y_ego], axis=-1)    # (T, 2)
@@ -63,10 +73,15 @@ def compute_mttc_vectorized(
     a_ego = a_ego.at[1:].set((v_ego[1:] - v_ego[:-1]) / 0.1)  # dt = 0.1s
     
     # === GET ALL OBJECT TRAJECTORIES ===
-    x_all = jnp.where(time_mask[None, :], state.log_trajectory.x, 0.0)
-    y_all = jnp.where(time_mask[None, :], state.log_trajectory.y, 0.0)
-    vx_all = jnp.where(time_mask[None, :], state.log_trajectory.vel_x, 0.0)
-    vy_all = jnp.where(time_mask[None, :], state.log_trajectory.vel_y, 0.0)
+    x_all = simulated_state[:, 0, :]
+    y_all = simulated_state[:, 1, :]
+    vx_all = simulated_state[:, 2, :]
+    vy_all = simulated_state[:, 3, :]
+    
+    #x_all = jnp.where(time_mask[None, :], state.log_trajectory.x, 0.0)
+    #y_all = jnp.where(time_mask[None, :], state.log_trajectory.y, 0.0)
+    #vx_all = jnp.where(time_mask[None, :], state.log_trajectory.vel_x, 0.0)
+    #vy_all = jnp.where(time_mask[None, :], state.log_trajectory.vel_y, 0.0)
     
     v_all = jnp.stack([vx_all, vy_all], axis=-1)  # (num_objects, T, 2)
     p_all = jnp.stack([x_all, y_all], axis=-1)    # (num_objects, T, 2)
@@ -96,7 +111,7 @@ def compute_mttc_vectorized(
     # MTTC = (-ΔV ± √(ΔV² + 2·Δa·D)) / Δa
     
     # Discriminant
-    discriminant = delta_V**2 + 2 * delta_a * np.abs(D)  # (num_objects, T)
+    discriminant = delta_V**2 + 2 * delta_a * D # (num_objects, T)
     
     # Only valid if discriminant >= 0
     valid_discriminant = discriminant >= 0
@@ -116,20 +131,20 @@ def compute_mttc_vectorized(
     mttc_per_timestep = jnp.minimum(mttc_1, mttc_2)  # (num_objects, T)
     
     # === SPECIAL CASE: Δa ≈ 0 (constant velocity) ===
-    # When Δa is very small, use TTC = D / (-ΔV)
-    small_accel = jnp.abs(delta_a) < 1e-3
-    ttc_constant_vel = D / (-delta_V + 1e-9)
-    ttc_constant_vel = jnp.where(
-        (ttc_constant_vel > 0) & (delta_V < 0),  # Approaching
-        ttc_constant_vel,
+    true_dist = np.abs(D) - lengths_all/2 - lengths_all/2
+    ttc_fallback = true_dist / (jnp.abs(delta_V) + 1e-9)
+    is_temporal_threat = ttc_fallback < 5.0
+    ttc_fallback = jnp.where(
+        is_temporal_threat,
+        ttc_fallback,
         jnp.inf
     )
-    
+
     # Use constant velocity TTC when acceleration is negligible
-    mttc_per_timestep = jnp.where(small_accel, ttc_constant_vel, mttc_per_timestep)
+    mttc_per_timestep = jnp.where(jnp.isinf(mttc_per_timestep), ttc_fallback, mttc_per_timestep)
     
     # === CHECK APPROACHING CONDITION ===
-    def valid_mttc_condition(pos_rel, vel_rel, v_ego, v_all, dist, ego_heading, fov_angle=180, min_dist=1.0):
+    def valid_mttc_condition(x_all, v_ego, v_all, obj_types, av_index):
         """
         Determine if MTTC is applicable based on spatial and directional constraints.
 
@@ -143,50 +158,31 @@ def compute_mttc_vectorized(
         Returns:
             mask: boolean (N,) array where MTTC is valid
         """
-        # Normalize vectors
-        pos_norm = pos_rel / (jnp.linalg.norm(pos_rel, axis=2, keepdims=True) + 1e-6)
-        vel_norm = vel_rel / (jnp.linalg.norm(vel_rel, axis=2, keepdims=True) + 1e-6)
-
-        # Relative motion direction: cosine of angle between position and relative velocity
-        cos_theta = jnp.sum(pos_norm * vel_norm, axis=2)
+        # Condition 1: filter only vehicle agents
+        vehicle_indices = (obj_types == 1) & (obj_types != av_index)
+        vehicle_indices = np.tile(vehicle_indices[:, None], (1, 91))
+        other_vehicle_indices = [i for i in range(len(obj_types))
+                             if i != av_index and obj_types[i] == 1]
         
-        ego_heading_vec = jnp.stack([jnp.cos(ego_heading), jnp.sin(ego_heading)], axis=1)  # (T, 2)
-
-        # Cosine of angle between position vector and ego heading direction
-        cos_heading = jnp.einsum('ntc,tc->nt', pos_norm, ego_heading_vec)
-
-        # Condition 1: moving toward ego (cos_theta < 0)
-        moving_toward = cos_theta < -0.1
-
-        # Condition 2: within ego field of view
-        # within_fov = cos_heading > jnp.cos(jnp.deg2rad(fov_angle / 2))
-
-        # Condition 3: object direction consistent with ego direction (not opposite)
-        dot = jnp.einsum('ij,kij->ki', v_ego, v_all)  # (num_objects, T)
-        norm_av = jnp.linalg.norm(v_ego, axis=1)      # (T,)
-        norm_all = jnp.linalg.norm(v_all, axis=2)    # (num_objects, T)
-        norm_product = norm_av[None, :] * norm_all   # (num_objects, T)
-        cos_angle = jnp.where(norm_product > 0, dot / norm_product, 0.0)
+        dot = np.einsum('ij,kij->ki', v_ego, v_all)
+        norm = np.linalg.norm(v_ego, axis=1) * np.linalg.norm(v_all, axis=2)
+        cos_angle = np.divide(dot, norm, out=np.zeros_like(dot), where=norm > 0)
         same_direction = cos_angle > 0.9
 
-        valid_mask = moving_toward & same_direction
+        valid_mask = vehicle_indices & same_direction
         return valid_mask
     
-    valid = valid_mttc_condition(rel_pos, rel_vel, v_ego, v_all, D, heading_ego, heading_all)
-    mttc_per_timestep = jnp.where(valid, mttc_per_timestep, jnp.inf)
-
-    # === AGGREGATE: Minimum MTTC across trajectory ===
-    min_mttc_per_object = jnp.min(mttc_per_timestep, axis=1)  # (num_objects,)
+    obj_types = state.object_metadata.object_types
+    valid = valid_mttc_condition(x_all, v_ego, v_all, obj_types, ego_idx)
+    mttc_per_object = jnp.where(valid, mttc_per_timestep, jnp.inf)
+    mttc_for_time = mttc_per_object[:,time]
     
     # === CONVERT MTTC TO RISK ===
-    def mttc_to_risk_vectorized(mttc_val):
-        mttc_val = jnp.clip(mttc_val, 1e-3, None)
-        decay_rate = jnp.log(2) / (safe_ttc - critical_ttc)
-        risk = jnp.exp(-decay_rate * (mttc_val - critical_ttc))
-        risk = jnp.clip(risk, 0.0, 1.0)
+    def mttc_to_risk_vectorized(mttc_val, t0=2.0, k=2.0):
+        risk = 1 / (1 + jnp.exp((1/k) * (mttc_val - t0)))
         return risk
     
-    risk_values = jax.vmap(mttc_to_risk_vectorized)(min_mttc_per_object)
+    risk_values = jax.vmap(mttc_to_risk_vectorized)(mttc_for_time)
     
     # === MASK OUT EGO AND INVALID OBJECTS ===
     valid_mask = state.object_metadata.is_valid
@@ -201,11 +197,12 @@ def compute_mttc_vectorized(
 def create_mttc_risk_grid(
     state: datatypes.SimulatorState,
     ego_idx: int,
+    time: int,
     grid_size: int = 64,
     grid_range_long: float = 50.0,  # Longitudinal: ±50m (100m total)
     grid_range_lat: float = 15.0,   # Lateral: ±15m (30m total) - road width
     prediction_horizon: float = 5.0,
-    num_prediction_steps: int = 3
+    num_prediction_steps: int = 1
 ) -> jnp.ndarray:
     """
     Create ground truth risk grid based on vectorized MTTC computation.
@@ -230,18 +227,23 @@ def create_mttc_risk_grid(
                    Note: grid is rectangular in world space but square in grid space
     """
     # Compute MTTC risk for all objects (vectorized)
-    risk_per_object = compute_mttc_vectorized(state, ego_idx)  # (num_objects,)
-    
+    risk_per_object = compute_mttc_vectorized(state, ego_idx, time)  # (num_objects,)
+    jax.debug.print("risk per object: {}", risk_per_object)
+    sid = str(state.object_metadata.scenario_id)
+    sid = sid[3:-2]
+    filename = 'docs/cutin_filtered_data/' + str(sid) + '_modified.pkl'
+    with open(filename, 'rb') as f:
+        simulated_state = pickle.load(f)
     # Get current positions and velocities
-    current_timestep = state.timestep
+    current_timestep = time
     positions = jnp.stack([
-        state.sim_trajectory.x[:, current_timestep],
-        state.sim_trajectory.y[:, current_timestep]
+        simulated_state[:, 0, current_timestep],
+        simulated_state[:, 1, current_timestep]
     ], axis=-1)  # (num_objects, 2)  # (num_objects, 2)
     velocities = jnp.stack([
-        state.sim_trajectory.vel_x[:, current_timestep],
-        state.sim_trajectory.vel_y[:, current_timestep]
-    ], axis=-1)  # (num_objects, 2)
+        simulated_state[:, 2, current_timestep],
+        simulated_state[:, 3, current_timestep]
+    ], axis=-1) # (num_objects, 2)
     
     # Get vehicle dimensions
     lengths = state.sim_trajectory.length[:, current_timestep]  # (num_objects,)
@@ -251,10 +253,13 @@ def create_mttc_risk_grid(
     ego_pos = positions[ego_idx]
     ego_vel = velocities[ego_idx]
     ego_yaw = yaws[ego_idx]
-    
+    vx_ego = simulated_state[ego_idx, 2, current_timestep]
+    vy_ego = simulated_state[ego_idx, 3, current_timestep]
+    v_ego = jnp.stack([vx_ego, vy_ego], axis=-1)  # (T, 2)
+    heading_ego = jnp.arctan2(v_ego[..., 1], v_ego[..., 0])
     # Get ego's forward direction (longitudinal axis)
-    ego_forward = jnp.array([jnp.cos(ego_yaw), jnp.sin(ego_yaw)])
-    ego_lateral = jnp.array([-jnp.sin(ego_yaw), jnp.cos(ego_yaw)])  # perpendicular
+    ego_forward = jnp.array([jnp.cos(heading_ego), jnp.sin(heading_ego)])
+    ego_lateral = jnp.array([-jnp.sin(heading_ego), jnp.cos(heading_ego)])  # perpendicular
     
     # Initialize grid
     risk_grid = jnp.zeros((grid_size, grid_size), dtype=jnp.float32)
@@ -285,10 +290,10 @@ def create_mttc_risk_grid(
         obj_length = lengths[obj_idx]
         obj_width = widths[obj_idx]
         obj_yaw = yaws[obj_idx]
-        
         # Check if object is valid and has non-zero risk
         is_valid = state.object_metadata.is_valid[obj_idx] & (obj_idx != ego_idx) & (obj_risk > 0.01)
-        
+        #jax.debug.print("object idx:{} is valid: {}, ego id:{}", obj_idx, is_valid, ego_idx)
+        #jax.debug.print("state isvalid: {}, risk of object:{}", state.object_metadata.is_valid[obj_idx], obj_risk)
         def project_object():
             # Project future positions
             time_steps = jnp.arange(num_prediction_steps) * dt
@@ -304,8 +309,8 @@ def create_mttc_risk_grid(
             rel_lat = jnp.einsum('si,i->s', rel_pos_world, ego_lateral)   # (steps,)
             
             # Convert to grid coordinates (rectangular grid)
-            grid_x = ((rel_long + grid_range_long) / cell_size_long).astype(jnp.int32)
-            grid_y = ((rel_lat + grid_range_lat) / cell_size_lat).astype(jnp.int32)
+            grid_x = jnp.round((rel_long + grid_range_long) / cell_size_long).astype(jnp.int32)
+            grid_y = jnp.round((rel_lat + grid_range_lat) / cell_size_lat).astype(jnp.int32)
             
             # Calculate footprint size based on vehicle dimensions
             # How many cells does this vehicle occupy?
@@ -320,7 +325,7 @@ def create_mttc_risk_grid(
                 # Check if center is in bounds
                 in_bounds = (center_x >= 0) & (center_x < grid_size) & \
                            (center_y >= 0) & (center_y < grid_size)
-                
+
                 # Time decay
                 time_decay = 1.0 - (step_idx / num_prediction_steps) * 0.3
                 decayed_risk = obj_risk * time_decay
@@ -367,7 +372,7 @@ def create_mttc_risk_grid(
                     
                     # Use scatter_max to update (takes maximum risk value)
                     updated_flat = flat_grid.at[flat_indices].max(valid_risks)
-                    
+                    jax.debug.print("object id added: {}", obj_idx)
                     # Reshape back to 2D
                     return updated_flat.reshape(grid_size, grid_size)
                 
@@ -585,3 +590,4 @@ if __name__ == "__main__":
     print("2. Considers ALL agents (truly multi-agent)")
     print("3. No need for lead_idx - model learns relevant agents")
     print("4. Includes predicted trajectories in risk assessment")
+    
