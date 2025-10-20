@@ -14,8 +14,224 @@ import pickle
 # MTTC-BASED GROUND TRUTH RISK GRID
 # ============================================================================
 
-
 def compute_mttc_vectorized(
+    state: datatypes.SimulatorState,
+    ego_idx: int,
+    time: int, 
+    max_timesteps: int = 91,
+    critical_ttc: float = 1,
+    safe_ttc: float = 5.0
+) -> jnp.ndarray:
+    """
+    Vectorized computation of Modified Time-To-Collision for ALL agents.
+    
+    Uses proper MTTC formula: MTTC = (-ΔV ± √(ΔV² + 2·Δa·D)) / Δa
+    where ΔV is relative velocity, Δa is relative acceleration, D is distance.
+    
+    Includes lane-aware TTC fallback for better handling of adjacent lane vehicles.
+    
+    Args:
+        state: Current simulator state
+        ego_idx: Ego vehicle index
+        max_timesteps: Maximum timesteps to consider
+        critical_ttc: Time threshold for critical risk
+        safe_ttc: Time threshold for safe operation
+    
+    Returns:
+        mttc_risk: (num_objects,) array with risk values [0, 1] for each object
+    """
+    num_objects = state.log_trajectory.x.shape[0]
+    traj_length = state.log_trajectory.x.shape[1]
+    T = jnp.minimum(max_timesteps, traj_length)
+    
+    time_mask = jnp.arange(traj_length) < T
+    
+    lengths_all = state.log_trajectory.length
+    widths_all = state.log_trajectory.width
+    sid = str(state.object_metadata.scenario_id)
+    sid = sid[3:-2]
+    filename = 'docs/filtered_data_CCNN/' + str(sid) + '_modified.pkl'
+    with open(filename, 'rb') as f:
+        simulated_state = pickle.load(f)
+    
+    # === GET EGO TRAJECTORY ===
+    x_ego = simulated_state[ego_idx, 0, :]
+    y_ego = simulated_state[ego_idx, 1, :]
+    vx_ego = simulated_state[ego_idx, 2, :]
+    vy_ego = simulated_state[ego_idx, 3, :]
+    
+    v_ego = jnp.stack([vx_ego, vy_ego], axis=-1)  # (T, 2)
+    p_ego = jnp.stack([x_ego, y_ego], axis=-1)    # (T, 2)
+    heading_ego = jnp.arctan2(v_ego[..., 1], v_ego[..., 0])
+    heading_ego = jnp.unwrap(heading_ego, axis=0)
+    
+    # Compute ego acceleration (finite differences)
+    a_ego = jnp.zeros_like(v_ego)
+    a_ego = a_ego.at[1:].set((v_ego[1:] - v_ego[:-1]) / 0.1)  # dt = 0.1s
+    
+    # === GET ALL OBJECT TRAJECTORIES ===
+    x_all = simulated_state[:, 0, :]
+    y_all = simulated_state[:, 1, :]
+    vx_all = simulated_state[:, 2, :]
+    vy_all = simulated_state[:, 3, :]
+    
+    v_all = jnp.stack([vx_all, vy_all], axis=-1)  # (num_objects, T, 2)
+    p_all = jnp.stack([x_all, y_all], axis=-1)    # (num_objects, T, 2)
+    heading_all = jnp.arctan2(v_all[..., 1], v_all[..., 0])
+    heading_all = jnp.unwrap(heading_all, axis=0)
+
+    # Compute all object accelerations
+    a_all = jnp.zeros_like(v_all)
+    a_all = a_all.at[:, 1:, :].set((v_all[:, 1:, :] - v_all[:, :-1, :]) / 0.1)
+    
+    # === COMPUTE RELATIVE QUANTITIES ===
+    rel_pos = p_all - p_ego[None, :, :]  # (num_objects, T, 2)
+    rel_vel = v_all - v_ego[None, :, :]  # (num_objects, T, 2)
+    rel_acc = a_all - a_ego[None, :, :]  # (num_objects, T, 2)
+    
+    # === PROJECT TO 1D (LONGITUDINAL AND LATERAL) ===
+    # Use ego velocity direction as longitudinal axis
+    ego_speed = jnp.linalg.norm(v_ego, axis=1, keepdims=True) + 1e-6  # (T, 1)
+    ego_dir = v_ego / ego_speed  # (T, 2) - normalized direction
+    
+    # Lateral direction (perpendicular to ego direction)
+    ego_lateral_dir = jnp.stack([-ego_dir[:, 1], ego_dir[:, 0]], axis=-1)  # (T, 2)
+    
+    # Project relative quantities onto ego's longitudinal and lateral axes
+    D_long = jnp.einsum('kti,ti->kt', rel_pos, ego_dir)  # (num_objects, T) - longitudinal distance
+    D_lat = jnp.einsum('kti,ti->kt', rel_pos, ego_lateral_dir)  # (num_objects, T) - lateral distance
+    
+    delta_V_long = jnp.einsum('kti,ti->kt', rel_vel, ego_dir)  # (num_objects, T) - longitudinal velocity
+    delta_V_lat = jnp.einsum('kti,ti->kt', rel_vel, ego_lateral_dir)  # (num_objects, T) - lateral velocity
+    
+    delta_a_long = jnp.einsum('kti,ti->kt', rel_acc, ego_dir)  # (num_objects, T) - longitudinal acceleration
+    
+    # === COMPUTE MTTC USING PROPER FORMULA ===
+    # MTTC = (-ΔV ± √(ΔV² + 2·Δa·D)) / Δa
+    
+    # Discriminant
+    discriminant = delta_V_long**2 + 2 * delta_a_long * D_long  # (num_objects, T)
+    
+    # Only valid if discriminant >= 0 and acceleration is significant
+    valid_discriminant = discriminant >= 0
+    significant_accel = jnp.abs(delta_a_long) >= 1e-3
+    
+    # Compute both solutions
+    sqrt_term = jnp.sqrt(jnp.maximum(discriminant, 0.0))
+    
+    # Two possible MTTC values
+    mttc_1 = (-delta_V_long + sqrt_term) / (delta_a_long + 1e-9)
+    mttc_2 = (-delta_V_long - sqrt_term) / (delta_a_long + 1e-9)
+    
+    # Select smallest positive value
+    mttc_1 = jnp.where((mttc_1 > 0) & valid_discriminant & significant_accel, mttc_1, jnp.inf)
+    mttc_2 = jnp.where((mttc_2 > 0) & valid_discriminant & significant_accel, mttc_2, jnp.inf)
+    
+    mttc_per_timestep = jnp.minimum(mttc_1, mttc_2)  # (num_objects, T)
+    
+    # === LANE-AWARE TTC FALLBACK ===
+    # Account for vehicle dimensions
+    # Get ego dimensions at current time (assuming constant, take first timestep)
+    ego_length = lengths_all[ego_idx, 0] if lengths_all.ndim > 1 else lengths_all[ego_idx]
+    ego_width = widths_all[ego_idx, 0] if widths_all.ndim > 1 else widths_all[ego_idx]
+
+    # Get all object dimensions (take first timestep if time-varying)
+    obj_lengths = lengths_all[:, 0] if lengths_all.ndim > 1 else lengths_all  # (num_objects,)
+    obj_widths = widths_all[:, 0] if widths_all.ndim > 1 else widths_all      # (num_objects,)
+
+    long_clearance = (obj_lengths[:, None] + ego_length) / 2  # (num_objects, 1) -> (num_objects, T)
+    lat_clearance = (obj_widths[:, None] + ego_width) / 2     # (num_objects, 1) -> (num_objects, T)
+
+    # True distances accounting for vehicle size
+    true_long_dist = jnp.maximum(jnp.abs(D_long) - long_clearance, 0.0)
+    true_lat_dist = jnp.abs(D_lat) - lat_clearance
+    
+    # Lane classification (typical lane width ~3.5m)
+    LANE_WIDTH = 3.5
+    is_same_lane = jnp.abs(D_lat) < (LANE_WIDTH / 2)  # Within half lane width of ego
+    is_adjacent_lane = (jnp.abs(D_lat) >= (LANE_WIDTH / 2)) & (jnp.abs(D_lat) < (1.5 * LANE_WIDTH))
+    
+    # Determine if vehicle is crossing into ego's lane
+    is_crossing = jnp.abs(delta_V_lat) > 0.3  # Lateral velocity > 0.3 m/s
+    crossing_toward_ego = (D_lat * delta_V_lat) < 0  # Opposite signs = moving toward ego
+    is_lane_change_threat = is_crossing & crossing_toward_ego
+    
+    # Vehicle is ahead (positive longitudinal distance)
+    is_ahead = D_long > 0
+    is_longitudinally_close = jnp.abs(D_long) < 50.0  # Within 50m
+    
+    # === COMPUTE LANE-AWARE TTC ===
+    
+    # Same lane: pure longitudinal TTC
+    ttc_same_lane = true_long_dist / (jnp.abs(delta_V_long) + 1e-9)
+    ttc_lateral_crossing = jnp.abs(true_lat_dist) / (jnp.abs(delta_V_lat) + 1e-9)
+    
+    future_long_dist = D_long + delta_V_long * ttc_lateral_crossing
+    future_long_gap = jnp.abs(future_long_dist) - long_clearance
+    
+    # Compute effective TTC for lane change scenario:
+    # If vehicle will be ahead after merging: use lateral crossing time
+    # If vehicle will be behind after merging: less urgent, scale up the TTC
+    # If vehicle will be very far: effectively infinite
+    
+    # Weight factor based on predicted longitudinal separation after merge
+    # Closer = more urgent (weight closer to 1), farther = less urgent (weight > 1)
+    THREAT_DISTANCE = 30.0  # Consider threats within 30m after merge
+    long_weight = jnp.clip(future_long_gap / THREAT_DISTANCE, 0.5, 10.0)
+    
+    # Effective TTC accounts for both lateral crossing AND longitudinal proximity
+    # Multiply by weight: closer vehicles have TTC ≈ lateral crossing time
+    # Distant vehicles have inflated TTC (less urgent)
+    
+    ttc_lane_change = ttc_lateral_crossing * long_weight
+    
+    # Only valid if vehicle is ahead after merging (behind vehicles are less concerning)
+    ttc_lane_change = jnp.where(
+        future_long_dist > 0,  # Will be ahead
+        ttc_lane_change,
+        ttc_lane_change * 2.0  # If behind, double the TTC (less urgent)
+    )
+
+    # Select appropriate TTC based on lane position
+    ttc_fallback = jnp.where(
+        is_same_lane & is_ahead & is_longitudinally_close,
+        ttc_same_lane,  # Same lane: use longitudinal TTC
+        jnp.where(
+            is_adjacent_lane & is_lane_change_threat & is_longitudinally_close,
+            ttc_lane_change,  # Adjacent + crossing: use combined TTC
+            jnp.inf  # Otherwise: no threat
+        )
+    )
+    
+    # Additional filtering: only consider reasonable TTC values
+    ttc_fallback = jnp.where(ttc_fallback < 30.0, ttc_fallback, jnp.inf)
+    
+    # === MERGE MTTC AND TTC ===
+    # Use TTC fallback wherever MTTC is infinite
+    final_ttc_per_timestep = jnp.where(
+        jnp.isinf(mttc_per_timestep),
+        ttc_fallback,
+        mttc_per_timestep
+    )
+    
+    # === AGGREGATE OVER TIME ===
+    # Take minimum TTC across all timesteps for each object
+    mttc_at_time = final_ttc_per_timestep[:,time]  # (num_objects,)
+    
+    # === CONVERT TTC TO RISK ===
+    # Risk = 1 when TTC < critical_ttc, Risk = 0 when TTC > safe_ttc
+    # Smooth interpolation in between
+
+    def mttc_to_risk_vectorized(mttc_val, t0=2.0, k=2.0):
+        risk = 1 / (1 + jnp.exp((1/k) * (mttc_val - t0)))
+        return risk
+    risk_per_object = jax.vmap(mttc_to_risk_vectorized)(mttc_at_time)
+    # Set ego risk to 0
+    risk_per_object = risk_per_object.at[ego_idx].set(0.0)
+    return risk_per_object
+
+
+def compute_mttc_vectorized_v0(
     state: datatypes.SimulatorState,
     ego_idx: int,
     time: int, 
@@ -49,7 +265,7 @@ def compute_mttc_vectorized(
     widths_all = state.log_trajectory.width
     sid = str(state.object_metadata.scenario_id)
     sid = sid[3:-2]
-    filename = 'docs/cutin_filtered_data/' + str(sid) + '_modified.pkl'
+    filename = 'docs/filtered_data_CCNN/' + str(sid) + '_modified.pkl'
     with open(filename, 'rb') as f:
         simulated_state = pickle.load(f)
     
@@ -228,10 +444,10 @@ def create_mttc_risk_grid(
     """
     # Compute MTTC risk for all objects (vectorized)
     risk_per_object = compute_mttc_vectorized(state, ego_idx, time)  # (num_objects,)
-    jax.debug.print("risk per object: {}", risk_per_object)
+    #jax.debug.print("risk per object: {}", risk_per_object)
     sid = str(state.object_metadata.scenario_id)
     sid = sid[3:-2]
-    filename = 'docs/cutin_filtered_data/' + str(sid) + '_modified.pkl'
+    filename = 'docs/filtered_data_CCNN/' + str(sid) + '_modified.pkl'
     with open(filename, 'rb') as f:
         simulated_state = pickle.load(f)
     # Get current positions and velocities
@@ -372,7 +588,7 @@ def create_mttc_risk_grid(
                     
                     # Use scatter_max to update (takes maximum risk value)
                     updated_flat = flat_grid.at[flat_indices].max(valid_risks)
-                    jax.debug.print("object id added: {}", obj_idx)
+                    #jax.debug.print("object id added: {}", obj_idx)
                     # Reshape back to 2D
                     return updated_flat.reshape(grid_size, grid_size)
                 
@@ -414,7 +630,7 @@ def create_mttc_risk_grid(
 # MULTI-AGENT OBSERVATION EXTRACTION
 # ============================================================================
 
-def extract_multi_agent_observations(
+def extract_multi_agent_observations_old(
     state: datatypes.SimulatorState,
     ego_idx: int,
     history_length: int = 10,
@@ -513,6 +729,94 @@ def extract_multi_agent_observations(
     
     return jnp.stack(observations)
 
+
+def extract_multi_agent_observations(
+    state: datatypes.SimulatorState,
+    ego_idx: int,
+    history_length: int = 10,
+    max_agents: int = 8
+) -> jnp.ndarray:
+    """
+    Returns:
+        observations: (history_length, max_agents, 6) array
+        For each agent: [rel_x, rel_y, rel_vx, rel_vy, speed, distance]
+    """
+    current_timestep = state.timestep
+    ego_pos_current = state.sim_trajectory.xy[ego_idx, current_timestep]
+    
+    # Find K nearest valid agents
+    distances = []
+    valid_indices = []
+    
+    for obj_idx in range(state.sim_trajectory.num_objects):
+        if obj_idx == ego_idx:
+            continue
+        if not state.object_metadata.is_valid[obj_idx]:
+            continue
+        
+        obj_pos = state.sim_trajectory.xy[obj_idx, current_timestep]
+        dist = jnp.linalg.norm(obj_pos - ego_pos_current)
+        distances.append(dist)
+        valid_indices.append(obj_idx)
+    
+    # Sort by distance and take closest max_agents
+    if len(distances) > 0:
+        sorted_idx = jnp.argsort(jnp.array(distances))
+        nearest_indices = [valid_indices[i] for i in sorted_idx[:max_agents]]
+    else:
+        nearest_indices = []
+    
+    # Pad if fewer than max_agents
+    while len(nearest_indices) < max_agents:
+        nearest_indices.append(-1)
+    
+    observations = []
+    
+    for t in range(max(0, current_timestep - history_length + 1), current_timestep + 1):
+        ego_pos = state.sim_trajectory.xy[ego_idx, t]
+        ego_vel = jnp.array([
+            state.sim_trajectory.vel_x[ego_idx, t],
+            state.sim_trajectory.vel_y[ego_idx, t]
+        ])
+        
+        timestep_agents = []  # List of agent features
+        
+        for agent_idx in nearest_indices:
+            if agent_idx == -1:
+                agent_features = jnp.zeros(6)
+            else:
+                agent_pos = state.sim_trajectory.xy[agent_idx, t]
+                agent_vel = jnp.array([
+                    state.sim_trajectory.vel_x[agent_idx, t],
+                    state.sim_trajectory.vel_y[agent_idx, t]
+                ])
+                
+                rel_pos = agent_pos - ego_pos
+                rel_vel = agent_vel - ego_vel
+                agent_speed = jnp.linalg.norm(agent_vel)
+                distance = jnp.linalg.norm(rel_pos)
+                
+                agent_features = jnp.array([
+                    rel_pos[0],
+                    rel_pos[1],
+                    rel_vel[0],
+                    rel_vel[1],
+                    agent_speed,
+                    distance
+                ])
+            
+            timestep_agents.append(agent_features)
+        
+        # Stack agents: (max_agents, 6)
+        obs = jnp.stack(timestep_agents)  # Changed from concatenate
+        observations.append(obs)
+    
+    # Pad history if needed
+    while len(observations) < history_length:
+        observations.insert(0, observations[0])
+    
+    # Stack timesteps: (history_length, max_agents, 6)
+    return jnp.stack(observations)
 
 # ============================================================================
 # UPDATED MODEL ARCHITECTURE FOR MULTI-AGENT

@@ -43,17 +43,17 @@ def train_step(state, batch, model, rng):
             )
         
         # Binary cross-entropy loss
-        bce_loss = optax.sigmoid_binary_cross_entropy(predictions, batch['risk_labels'])
-        
+        #bce_loss = optax.sigmoid_binary_cross_entropy(predictions, batch['risk_labels'])
+        mse_loss = jnp.mean((predictions - batch['risk_labels']) ** 2) 
         # Spatial smoothness regularization
         dx = predictions[:, 1:, :, :] - predictions[:, :-1, :, :]
         dy = predictions[:, :, 1:, :] - predictions[:, :, :-1, :]
         smoothness_loss = jnp.mean(dx**2) + jnp.mean(dy**2)
         
-        total_loss = jnp.mean(bce_loss) + 0.01 * smoothness_loss
+        total_loss = jnp.mean(mse_loss) + 0.01 * smoothness_loss
         
         return total_loss, {
-            'bce': jnp.mean(bce_loss),
+            'bce': jnp.mean(mse_loss),
             'smoothness': smoothness_loss,
             'total': total_loss
         }
@@ -117,7 +117,7 @@ def train_causal_risk_cnn(
     
     # Load filtered scenario IDs
     filtered_scenarios = [
-        f[:-4] for f in os.listdir(filtered_scenarios_dir) 
+        f[:-13] for f in os.listdir(filtered_scenarios_dir) 
         if f.endswith('.pkl')
     ]
     print(f"Found {len(filtered_scenarios)} filtered scenarios")
@@ -135,18 +135,18 @@ def train_causal_risk_cnn(
     print(f"Found {len(tfrecord_files)} TFRecord shards")
     
     # Initialize model with multi-agent input
-    obs_features = max_agents * 6
+    obs_features = 6
     
-    model = CausalRiskCNN(
-        grid_size=grid_size,
-        grid_range=grid_range,
-        history_length=history_length
-    )
+    model = CausalRiskCNN()
+        #grid_size=grid_size,
+        #grid_range=grid_range,
+        #history_length=history_length
+    #)
     
     # Initialize parameters
     rng = jax.random.PRNGKey(42)
-    dummy_obs = jnp.ones((1, history_length, obs_features))
-    params = model.init(rng, dummy_obs, training=False)
+    dummy_obs = jnp.ones((1, history_length, 8, obs_features))
+    params = model.init(rng, dummy_obs, training=True)
     
     # Create optimizer and training state
     optimizer = optax.adam(learning_rate)
@@ -244,7 +244,7 @@ def train_causal_risk_cnn(
                             
                             # Create ground truth risk grid using MTTC
                             risk_labels = create_mttc_risk_grid(
-                                temp_state, ego_idx, grid_size, grid_range
+                                temp_state, ego_idx, t, grid_size, grid_range
                             )
                         
                             # Prepare batch
@@ -395,12 +395,12 @@ def plot_training_curve(losses, save_path):
 
 if __name__ == "__main__":
     tfrecord_pattern = "data/motion_v_1_3_0/uncompressed/tf_example/training/training_tfexample.tfrecord-*"
-    filtered_scenarios_dir = "docs/cutin_filtered_data"
+    filtered_scenarios_dir = "docs/filtered_data_CCNN"
     run = wandb.init(
         entity="leah-camarcat",
         project="Waymax RL",
         config={
-            "epochs":100, 
+            "epochs":290, 
             "version": "v1"
         }
     )
@@ -408,15 +408,15 @@ if __name__ == "__main__":
     trained_params = train_causal_risk_cnn(
         tfrecord_pattern=tfrecord_pattern,
         filtered_scenarios_dir=filtered_scenarios_dir,
-        output_path="waymax/agents/causal_cnn/trained_risk_model.pkl",
+        output_path="waymax/agents/causal_cnn/trained_risk_model_v2.pkl",
         grid_size=64,
         grid_range=50.0,
         history_length=10,
         max_agents=8,
         max_num_objects=32,
-        epochs_per_scenario=30,
-        learning_rate=1e-4,
-        save_every=10,  # Save every 50 scenarios
+        epochs_per_scenario=4,
+        learning_rate=1e-3,
+        save_every=10,  # Save every 10 scenarios
         use_mttc=True
     )
     run.finish()

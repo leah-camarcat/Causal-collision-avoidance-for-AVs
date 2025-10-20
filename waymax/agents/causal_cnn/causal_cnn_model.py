@@ -77,6 +77,17 @@ class SpatialAttention(nn.Module):
         out = x * attention  # broadcast across channels
         return out, attention
 
+class SpatialConv2D(nn.Module):
+    features: int
+    kernel_size: Tuple[int, int]
+
+    #@nn.compact
+    def __call__(self, x):
+        return nn.Conv(
+            features=self.features, 
+            kernel_size=self.kernel_size,
+            padding='SAME'  # Equal padding all sides
+        )(x)
 
 class TemporalAttention(nn.Module):
     """
@@ -176,7 +187,7 @@ class TemporalAttention(nn.Module):
         return attended, attn_weights
 
 
-class CausalRiskCNN(nn.Module):
+class CausalRiskCNN_old(nn.Module):
     """
     Causal CNN with temporal + spatial attention
     to predict a spatial risk grid around ego vehicle.
@@ -197,27 +208,27 @@ class CausalRiskCNN(nn.Module):
             attention_maps: dict with 'temporal_attention', 'spatial_attention'
         """
         batch_size = observations.shape[0]
-
+        print('shape of observations: ', observations.shape)
         # --- Temporal attention over history ---
         temporal_features, temporal_attention = TemporalAttention(
             hidden_dim=64
         )(observations)
-
+        
         # Use most recent attended features
         current_features = temporal_features[:, -1, :]
-
+        print("shape after temporal attention: ", current_features.shape)
         # --- Initialize spatial grid (low-res embedding) ---
         spatial_dim = 8  # starting resolution
         reshaped = nn.Dense(spatial_dim * spatial_dim * 32)(current_features)
         reshaped = reshaped.reshape(batch_size, spatial_dim, spatial_dim, 32)
-
+        print("shape after dense & reshape: ", reshaped.shape)
         x = reshaped
         attention_maps = {'temporal_attention': temporal_attention}
 
         # --- Causal CNN with spatial attention in middle ---
         for i, dim in enumerate(self.hidden_dims):
-            x = CausalConv2D(features=dim, kernel_size=(3, 3))(x)
-
+            x = SpatialConv2D(features=dim, kernel_size=(3, 3))(x)
+            print('shape after cnn', dim, x.shape)
             if i == len(self.hidden_dims) // 2:
                 x, spatial_attn = SpatialAttention()(x)
                 attention_maps['spatial_attention'] = spatial_attn
@@ -244,7 +255,7 @@ class CausalRiskCNN(nn.Module):
         # --- Final risk prediction ---
         risk_grid = nn.Conv(features=1, kernel_size=(1, 1))(x)
         risk_grid = nn.sigmoid(risk_grid)
-
+        print('shape risk grid: ', risk_grid.shape)
         return risk_grid, attention_maps
 
     def get_risk_at_position(self, risk_grid, x_meters, y_meters):
@@ -258,6 +269,114 @@ class CausalRiskCNN(nn.Module):
 
         return risk_grid[0, grid_x, grid_y, 0]
 
+
+class AgentEncoder(nn.Module):
+    """Encode individual agent features."""
+    hidden_dim: int = 32
+    
+    @nn.compact
+    def __call__(self, agent_features):
+        # agent_features: (batch, history, max_agents, 6)
+        x = nn.Dense(self.hidden_dim)(agent_features)
+        x = nn.relu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        return x  # (batch, history, max_agents, hidden_dim)
+
+
+class AgentAttention(nn.Module):
+    """Attention over agents (which agents matter most?)."""
+    hidden_dim: int = 32
+    
+    @nn.compact
+    def __call__(self, x):
+        # x: (batch, history, max_agents, features)
+        batch, history, agents, features = x.shape
+        
+        # Flatten history into batch for agent attention
+        x_flat = x.reshape(batch * history, agents, features)
+        
+        # Simple attention over agents
+        scores = nn.Dense(1)(x_flat)  # (batch*history, agents, 1)
+        attn_weights = nn.softmax(scores, axis=1)
+        
+        # Weighted sum over agents
+        attended = jnp.sum(x_flat * attn_weights, axis=1)  # (batch*history, features)
+        
+        # Reshape back
+        attended = attended.reshape(batch, history, features)
+        return attended, attn_weights
+
+
+class CausalRiskCNN(nn.Module):
+    grid_size: int = 64
+    hidden_dims: Tuple[int, ...] = (64, 128, 256, 128, 64)
+
+    @nn.compact
+    def __call__(self, observations, training: bool = False):
+        """
+        Args:
+            observations: (batch, history_length, max_agents, 6)
+        """
+        batch_size = observations.shape[0]
+        
+        # 1. Encode each agent
+        agent_encoded = AgentEncoder(hidden_dim=32)(observations)
+        
+        # 2. Attention over agents (which agents matter?)
+        agent_aggregated, agent_attn = AgentAttention(hidden_dim=32)(agent_encoded)
+        # Shape: (batch, history, 32)
+        
+        # 3. Temporal attention (how does history matter?)
+        temporal_features, temporal_attn = TemporalAttention(
+            hidden_dim=64
+        )(agent_aggregated)
+        
+        current_features = temporal_features[:, -1, :]
+        
+        # 4. Spatial grid generation and convolutions (same as before)
+        spatial_dim = 8
+        reshaped = nn.Dense(spatial_dim * spatial_dim * 32)(current_features)
+        x = reshaped.reshape(batch_size, spatial_dim, spatial_dim, 32)
+        
+        attention_maps = {
+            'temporal_attention': temporal_attn,
+            'agent_attention': agent_attn
+        }
+        
+        # Continue with spatial processing...
+        for i, dim in enumerate(self.hidden_dims):
+            x = nn.Conv(features=dim, kernel_size=(3, 3), padding='SAME')(x)
+            x = nn.relu(x)
+            
+            if i == len(self.hidden_dims) // 2:
+                x, spatial_attn = SpatialAttention()(x)
+                attention_maps['spatial_attention'] = spatial_attn
+            
+            if training:
+                x = nn.Dropout(rate=0.1)(x, deterministic=not training)
+        
+        # Upsample and predict risk
+        while x.shape[1] < self.grid_size:
+            x = jax.image.resize(
+                x,
+                shape=(batch_size, x.shape[1] * 2, x.shape[2] * 2, x.shape[3]),
+                method='bilinear'
+            )
+            x = nn.Conv(features=32, kernel_size=(3, 3), padding='SAME')(x)
+            x = nn.relu(x)
+        
+        if x.shape[1] != self.grid_size:
+            x = jax.image.resize(
+                x,
+                shape=(batch_size, self.grid_size, self.grid_size, x.shape[3]),
+                method='bilinear'
+            )
+        
+        risk_grid = nn.Conv(features=1, kernel_size=(1, 1))(x)
+        risk_grid = nn.sigmoid(risk_grid)
+        
+        return risk_grid, attention_maps
+    
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
