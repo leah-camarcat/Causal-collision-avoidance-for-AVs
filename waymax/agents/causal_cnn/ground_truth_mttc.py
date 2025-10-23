@@ -18,6 +18,8 @@ def compute_mttc_vectorized(
     state: datatypes.SimulatorState,
     ego_idx: int,
     time: int, 
+    filtered_scenarios_dir: str,
+    scenario_id: str,
     max_timesteps: int = 91,
     critical_ttc: float = 1,
     safe_ttc: float = 5.0
@@ -48,9 +50,7 @@ def compute_mttc_vectorized(
     
     lengths_all = state.log_trajectory.length
     widths_all = state.log_trajectory.width
-    sid = str(state.object_metadata.scenario_id)
-    sid = sid[3:-2]
-    filename = 'docs/filtered_data_CCNN/' + str(sid) + '_modified.pkl'
+    filename = filtered_scenarios_dir + str(scenario_id) + '_modified.pkl'
     with open(filename, 'rb') as f:
         simulated_state = pickle.load(f)
     
@@ -84,6 +84,19 @@ def compute_mttc_vectorized(
     a_all = jnp.zeros_like(v_all)
     a_all = a_all.at[:, 1:, :].set((v_all[:, 1:, :] - v_all[:, :-1, :]) / 0.1)
     
+    # === EXTRACT VEHICLE DIMENSIONS ===
+    # Get ego dimensions (assuming constant over time, take first timestep)
+    ego_length = lengths_all[ego_idx, 0] if lengths_all.ndim > 1 else lengths_all[ego_idx]
+    ego_width = widths_all[ego_idx, 0] if widths_all.ndim > 1 else widths_all[ego_idx]
+
+    # Get all object dimensions (num_objects,)
+    obj_lengths = lengths_all[:, 0] if lengths_all.ndim > 1 else lengths_all
+    obj_widths = widths_all[:, 0] if widths_all.ndim > 1 else widths_all
+    
+    # Clearance needed for collision: half of each vehicle's dimension
+    long_clearance = (obj_lengths[:, None] + ego_length) / 2  # Bumper-to-bumper clearance
+    lat_clearance = (obj_widths[:, None] + ego_width) / 2     # Side-to-side clearance
+    
     # === COMPUTE RELATIVE QUANTITIES ===
     rel_pos = p_all - p_ego[None, :, :]  # (num_objects, T, 2)
     rel_vel = v_all - v_ego[None, :, :]  # (num_objects, T, 2)
@@ -98,18 +111,30 @@ def compute_mttc_vectorized(
     ego_lateral_dir = jnp.stack([-ego_dir[:, 1], ego_dir[:, 0]], axis=-1)  # (T, 2)
     
     # Project relative quantities onto ego's longitudinal and lateral axes
-    D_long = jnp.einsum('kti,ti->kt', rel_pos, ego_dir)  # (num_objects, T) - longitudinal distance
-    D_lat = jnp.einsum('kti,ti->kt', rel_pos, ego_lateral_dir)  # (num_objects, T) - lateral distance
+    D_long_raw = jnp.einsum('kti,ti->kt', rel_pos, ego_dir)  # (num_objects, T) - longitudinal distance
+    D_lat_raw = jnp.einsum('kti,ti->kt', rel_pos, ego_lateral_dir)  # (num_objects, T) - lateral distance
     
-    delta_V_long = jnp.einsum('kti,ti->kt', rel_vel, ego_dir)  # (num_objects, T) - longitudinal velocity
-    delta_V_lat = jnp.einsum('kti,ti->kt', rel_vel, ego_lateral_dir)  # (num_objects, T) - lateral velocity
+    delta_V_long_raw = jnp.einsum('kti,ti->kt', rel_vel, ego_dir)  # (num_objects, T) - longitudinal velocity
+    delta_V_lat_raw = jnp.einsum('kti,ti->kt', rel_vel, ego_lateral_dir)  # (num_objects, T) - lateral velocity
     
-    delta_a_long = jnp.einsum('kti,ti->kt', rel_acc, ego_dir)  # (num_objects, T) - longitudinal acceleration
+    delta_a_long_raw = jnp.einsum('kti,ti->kt', rel_acc, ego_dir)  # (num_objects, T) - longitudinal acceleration
+    
+    # === ACCOUNT FOR VEHICLE DIMENSIONS ===
+    # Convert center-to-center distance to bumper-to-bumper (or side-to-side)
+    # Subtract the clearance and ensure non-negative
+    D_long = jnp.maximum(jnp.abs(D_long_raw) - long_clearance, 0.0)  # (num_objects, T)
+    D_lat = jnp.maximum(jnp.abs(D_lat_raw) - lat_clearance, 0.0)
+
+    object_is_ahead = D_long_raw > 0
+    D_long = jnp.where(object_is_ahead, D_long_raw, -D_long_raw)
+    delta_V_long = jnp.where(object_is_ahead, -delta_V_long_raw, delta_V_long_raw)
+    delta_a_long = jnp.where(object_is_ahead, -delta_a_long_raw, delta_a_long_raw)
     
     # === COMPUTE MTTC USING PROPER FORMULA ===
     # MTTC = (-ΔV ± √(ΔV² + 2·Δa·D)) / Δa
-    
+    # calculate delta v, delta a and 
     # Discriminant
+    
     discriminant = delta_V_long**2 + 2 * delta_a_long * D_long  # (num_objects, T)
     
     # Only valid if discriminant >= 0 and acceleration is significant
@@ -129,6 +154,22 @@ def compute_mttc_vectorized(
     
     mttc_per_timestep = jnp.minimum(mttc_1, mttc_2)  # (num_objects, T)
     
+    # === CONSTANT VELOCITY TTC (FALLBACK FOR LOW ACCELERATION) ===
+    ttc_constant_velocity = D_long / (jnp.abs(delta_V_long) + 1e-9)
+    
+    is_closing = delta_V_long > 0
+    ttc_constant_velocity = jnp.where(
+        is_closing & (jnp.abs(delta_V_long) > 0.1),
+        ttc_constant_velocity,
+        jnp.inf
+    )
+    
+    mttc_per_timestep = jnp.where(
+        ~significant_accel,
+        ttc_constant_velocity,
+        mttc_per_timestep
+    )
+    
     # === LANE-AWARE TTC FALLBACK ===
     # Account for vehicle dimensions
     # Get ego dimensions at current time (assuming constant, take first timestep)
@@ -143,89 +184,157 @@ def compute_mttc_vectorized(
     lat_clearance = (obj_widths[:, None] + ego_width) / 2     # (num_objects, 1) -> (num_objects, T)
 
     # True distances accounting for vehicle size
-    true_long_dist = jnp.maximum(jnp.abs(D_long) - long_clearance, 0.0)
-    true_lat_dist = jnp.abs(D_lat) - lat_clearance
+    true_long_dist = jnp.maximum(jnp.abs(D_long_raw) - long_clearance, 0.0)
+    true_lat_dist = jnp.maximum(jnp.abs(D_lat_raw) - lat_clearance, 0.0)
     
     # Lane classification (typical lane width ~3.5m)
     LANE_WIDTH = 3.5
-    is_same_lane = jnp.abs(D_lat) < (LANE_WIDTH / 2)  # Within half lane width of ego
-    is_adjacent_lane = (jnp.abs(D_lat) >= (LANE_WIDTH / 2)) & (jnp.abs(D_lat) < (1.5 * LANE_WIDTH))
+    is_same_lane = jnp.abs(D_lat_raw) < (LANE_WIDTH / 2)  # Within half lane width of ego
+    is_adjacent_lane = (jnp.abs(D_lat_raw) >= (LANE_WIDTH / 2)) #& (jnp.abs(D_lat) < (1.5 * LANE_WIDTH))
     
     # Determine if vehicle is crossing into ego's lane
-    is_crossing = jnp.abs(delta_V_lat) > 0.3  # Lateral velocity > 0.3 m/s
-    crossing_toward_ego = (D_lat * delta_V_lat) < 0  # Opposite signs = moving toward ego
-    is_lane_change_threat = is_crossing & crossing_toward_ego
+    is_lane_change_threat = (D_lat_raw * delta_V_lat_raw) < 0  # Opposite signs = moving toward ego
     
-    # Vehicle is ahead (positive longitudinal distance)
-    is_ahead = D_long > 0
     is_longitudinally_close = jnp.abs(D_long) < 50.0  # Within 50m
     
-    # === COMPUTE LANE-AWARE TTC ===
+    # === COMPUTE SAME LANE TTC ===
+    longitudinal_closing_speed = jnp.abs(delta_V_long_raw)
+    ttc_same_lane = D_long / (longitudinal_closing_speed + 1e-9)
     
-    # Same lane: pure longitudinal TTC
-    ttc_same_lane = true_long_dist / (jnp.abs(delta_V_long) + 1e-9)
-    ttc_lateral_crossing = jnp.abs(true_lat_dist) / (jnp.abs(delta_V_lat) + 1e-9)
+    longitudinal_closing = jnp.where(
+        object_is_ahead,
+        delta_V_long_raw < 0,  # Ego is closing on leader ahead
+        delta_V_long_raw > 0   # Object behind is closing on ego
+    )
     
-    future_long_dist = D_long + delta_V_long * ttc_lateral_crossing
-    future_long_gap = jnp.abs(future_long_dist) - long_clearance
+    ttc_same_lane = jnp.where(
+        longitudinal_closing,
+        ttc_same_lane,
+        jnp.inf
+    )
+
+    # === COMPUTE DIFFERENT LANE PET ===
+    crossing_toward_ego = (D_lat_raw * delta_V_lat_raw) < 0  # Opposite signs = closing
     
-    # Compute effective TTC for lane change scenario:
-    # If vehicle will be ahead after merging: use lateral crossing time
-    # If vehicle will be behind after merging: less urgent, scale up the TTC
-    # If vehicle will be very far: effectively infinite
+    vel_long = jnp.einsum('kti,ti->kt', v_all, ego_dir)  # (num_objects, T)
+    vel_lat = jnp.einsum('kti,ti->kt', v_all, ego_lateral_dir)  # (num_objects, T)
+    speed_all = jnp.linalg.norm(v_all, axis=2)
+    time_object_to_conflict = (np.abs(D_lat_raw)*1.4142) / (0.5*jnp.abs(vel_lat) + 0.5 * jnp.abs(vel_long) + 1e-9) 
+    obj_long_at_conflict = np.abs(D_long_raw) + vel_long * time_object_to_conflict
+
+    # Position of other vehicle when it crosses into ego's lane (absolute coords)
+    conflict_pos_other = p_all + v_all * time_object_to_conflict[..., None]  # (num_objects, T, 2)
     
-    # Weight factor based on predicted longitudinal separation after merge
-    # Closer = more urgent (weight closer to 1), farther = less urgent (weight > 1)
-    THREAT_DISTANCE = 30.0  # Consider threats within 30m after merge
-    long_weight = jnp.clip(future_long_gap / THREAT_DISTANCE, 0.5, 10.0)
+    # Position of ego at that same moment
+    ego_pos_at_other_crossing = p_ego[None, :, :] + v_ego[None, :, :] * time_object_to_conflict[..., None]  # (num_objects, T, 2)
     
-    # Effective TTC accounts for both lateral crossing AND longitudinal proximity
-    # Multiply by weight: closer vehicles have TTC ≈ lateral crossing time
-    # Distant vehicles have inflated TTC (less urgent)
+    # Distance from ego's position (when other crosses) to the conflict point
+    dist_ego_to_conflict_abs = jnp.linalg.norm(conflict_pos_other - ego_pos_at_other_crossing, axis=-1)  # (num_objects, T)
     
-    ttc_lane_change = ttc_lateral_crossing * long_weight
+    v_ego_along_ego_dir = jnp.linalg.norm(v_ego, axis=1)  # (T,) - ego's speed
+
+    # Time for ego to reach conflict point (longitudinal position obj_long_at_conflict)
+    # Starting from position 0, with velocity v_ego_along_ego_dir
+    time_ego_to_conflict = jnp.abs(obj_long_at_conflict) / (v_ego_along_ego_dir[None, :] + 1e-9)  # (num_objects, T)
     
-    # Only valid if vehicle is ahead after merging (behind vehicles are less concerning)
-    ttc_lane_change = jnp.where(
-        future_long_dist > 0,  # Will be ahead
-        ttc_lane_change,
-        ttc_lane_change * 2.0  # If behind, double the TTC (less urgent)
+    # If conflict is behind ego (obj_long_at_conflict < 0), ego has already passed
+    time_ego_to_conflict = jnp.where(
+        obj_long_at_conflict > 0,  # Conflict ahead
+        time_ego_to_conflict,
+        0.0  # Already passed
+    )
+    pet = jnp.abs(time_ego_to_conflict - time_object_to_conflict) 
+    is_valid_lane_change = (
+        #crossing_toward_ego &           # Moving into ego's lane
+        (time_object_to_conflict < 10.0) &  # Will cross soon (within 10s)
+        (time_object_to_conflict > 0)    # Valid positive time
+    )
+    
+    pet = jnp.where(
+        is_valid_lane_change,
+        pet,
+        jnp.inf  # No threat
+    )
+    
+    # Additional check: only flag if conflict point is in a reasonable range
+    CONFLICT_RANGE = 60.0  # Only consider conflicts within 60m
+    conflict_in_range = jnp.abs(obj_long_at_conflict) < CONFLICT_RANGE
+    
+    pet = jnp.where(
+        conflict_in_range,
+        pet,
+        jnp.inf
     )
 
     # Select appropriate TTC based on lane position
     ttc_fallback = jnp.where(
-        is_same_lane & is_ahead & is_longitudinally_close,
-        ttc_same_lane,  # Same lane: use longitudinal TTC
+        is_same_lane & is_longitudinally_close,
+        ttc_same_lane,
         jnp.where(
-            is_adjacent_lane & is_lane_change_threat & is_longitudinally_close,
-            ttc_lane_change,  # Adjacent + crossing: use combined TTC
-            jnp.inf  # Otherwise: no threat
+            is_adjacent_lane & is_longitudinally_close,
+            pet,
+            jnp.inf
         )
     )
     
     # Additional filtering: only consider reasonable TTC values
     ttc_fallback = jnp.where(ttc_fallback < 30.0, ttc_fallback, jnp.inf)
     
+    
+    # Additional filtering: only consider reasonable TTC values
+    #ttc_fallback = jnp.where(ttc_fallback < 30.0, ttc_fallback, jnp.inf)
+    
     # === MERGE MTTC AND TTC ===
     # Use TTC fallback wherever MTTC is infinite
-    final_ttc_per_timestep = jnp.where(
+    ssm_per_timestep = jnp.where(
         jnp.isinf(mttc_per_timestep),
         ttc_fallback,
         mttc_per_timestep
     )
+
+    # === CHECK APPROACHING CONDITION ===
+    def valid_mttc_condition(v_ego, v_all, obj_types, av_index):
+        """
+        Determine if MTTC is applicable based on spatial and directional constraints.
+
+        Args:
+            pos_rel: (N,2) relative position vectors (x,y)
+            vel_rel: (N,2) relative velocity vectors (x,y)
+            ego_heading: ego vehicle heading unit vector (2,)
+            fov_angle: field-of-view (degrees) in which MTTC applies (e.g. 180 for front, 360 for global)
+            min_dist: minimum distance threshold to avoid noise near ego
+
+        Returns:
+            mask: boolean (N,) array where MTTC is valid
+        """
+        # Condition 1: filter only vehicle agents
+        vehicle_indices = (obj_types == 1) & (obj_types != av_index)
+        vehicle_indices = np.tile(vehicle_indices[:, None], (1, 91))
+        other_vehicle_indices = [i for i in range(len(obj_types))
+                             if i != av_index and obj_types[i] == 1]
+        
+        dot = np.einsum('ij,kij->ki', v_ego, v_all)
+        norm = np.linalg.norm(v_ego, axis=1) * np.linalg.norm(v_all, axis=2)
+        cos_angle = np.divide(dot, norm, out=np.zeros_like(dot), where=norm > 0)
+        same_direction = cos_angle > 0.9
+
+        valid_mask = vehicle_indices & same_direction
+        return valid_mask
+    
+    obj_types = state.object_metadata.object_types
+    valid = valid_mttc_condition(v_ego, v_all, obj_types, ego_idx)
+    final_ssm_per_timestep = jnp.where(valid, ssm_per_timestep, jnp.inf)
+
     
     # === AGGREGATE OVER TIME ===
     # Take minimum TTC across all timesteps for each object
-    mttc_at_time = final_ttc_per_timestep[:,time]  # (num_objects,)
+    ssm_at_time = final_ssm_per_timestep[:,time]  # (num_objects,)
     
     # === CONVERT TTC TO RISK ===
-    # Risk = 1 when TTC < critical_ttc, Risk = 0 when TTC > safe_ttc
-    # Smooth interpolation in between
-
-    def mttc_to_risk_vectorized(mttc_val, t0=2.0, k=2.0):
-        risk = 1 / (1 + jnp.exp((1/k) * (mttc_val - t0)))
+    def mttc_to_risk_vectorized(mttc_val, t0=1.5, k=0.5):
+        risk = 1 / (1 + jnp.exp(k * (mttc_val - t0)))
         return risk
-    risk_per_object = jax.vmap(mttc_to_risk_vectorized)(mttc_at_time)
+    risk_per_object = jax.vmap(mttc_to_risk_vectorized)(ssm_at_time)
     # Set ego risk to 0
     risk_per_object = risk_per_object.at[ego_idx].set(0.0)
     return risk_per_object
@@ -414,6 +523,8 @@ def create_mttc_risk_grid(
     state: datatypes.SimulatorState,
     ego_idx: int,
     time: int,
+    filtered_scenarios_dir: str,
+    scenario_id: str,
     grid_size: int = 64,
     grid_range_long: float = 50.0,  # Longitudinal: ±50m (100m total)
     grid_range_lat: float = 15.0,   # Lateral: ±15m (30m total) - road width
@@ -443,11 +554,10 @@ def create_mttc_risk_grid(
                    Note: grid is rectangular in world space but square in grid space
     """
     # Compute MTTC risk for all objects (vectorized)
-    risk_per_object = compute_mttc_vectorized(state, ego_idx, time)  # (num_objects,)
+    risk_per_object = compute_mttc_vectorized(state, ego_idx, time, filtered_scenarios_dir, scenario_id)  # (num_objects,)
     #jax.debug.print("risk per object: {}", risk_per_object)
-    sid = str(state.object_metadata.scenario_id)
-    sid = sid[3:-2]
-    filename = 'docs/filtered_data_CCNN/' + str(sid) + '_modified.pkl'
+
+    filename = filtered_scenarios_dir + scenario_id + '_modified.pkl'
     with open(filename, 'rb') as f:
         simulated_state = pickle.load(f)
     # Get current positions and velocities
@@ -734,7 +844,7 @@ def extract_multi_agent_observations(
     state: datatypes.SimulatorState,
     ego_idx: int,
     history_length: int = 10,
-    max_agents: int = 8
+    max_agents: int = 8, 
 ) -> jnp.ndarray:
     """
     Returns:
