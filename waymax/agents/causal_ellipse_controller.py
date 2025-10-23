@@ -132,9 +132,9 @@ def causal_ellipse_actor_old(
         #jax.debug.print('ellipse values: {}', g_values_imminent)
         # Determine if intervention is needed
         min_g_imminent = jnp.min(g_values_imminent)
-        jax.debug.print('min ellipse values: {}', min_g_imminent)
+        #jax.debug.print('min ellipse values: {}', min_g_imminent)
         intervention_needed = min_g_imminent < SAFETY_BUFFER
-        jax.debug.print('intervention_needed: {}', intervention_needed)
+        #jax.debug.print('intervention_needed: {}', intervention_needed)
         
         return intervention_needed, min_g_imminent
 
@@ -562,12 +562,17 @@ def causal_ellipse_actor(
 
     def actor_init(rng, init_state):
         return {
+            "lateral_offset": jnp.array(0.0, dtype=jnp.float32),  # track current lateral position
             "reaction_timer": jnp.array(0, dtype=jnp.int32),
-            "lateral_offset": jnp.array(0.0, dtype=jnp.float32)  # track current lateral position
+            "has_reacted": jnp.array(False)
         }
 
     def select_action(params, state: datatypes.SimulatorState, actor_state=None, rng=None):
         is_controlled = is_controlled_func(state)
+                           
+        REACTION_STEPS = int(0.25 / datatypes.TIME_INTERVAL)
+        reaction_timer = actor_state["reaction_timer"]
+        has_reacted = actor_state["has_reacted"]
 
         # Extract current states
         traj_t0 = datatypes.dynamic_index(state.sim_trajectory, state.timestep, axis=-1, keepdims=True)
@@ -600,9 +605,9 @@ def causal_ellipse_actor(
         
         # Intervention needed if ellipse constraint will be violated
         intervention_needed = baseline_min_g < SAFETY_MARGIN
-        
-        jax.debug.print('Baseline min ellipse value: {}', baseline_min_g)
-        jax.debug.print('Intervention needed: {}', intervention_needed)
+        can_start_reaction = (~has_reacted) & (reaction_timer == 0) & intervention_needed
+        #jax.debug.print('Baseline min ellipse value: {}', baseline_min_g)
+        #jax.debug.print('Intervention needed: {}', intervention_needed)
 
         def select_evasive_maneuver():
             """Hierarchical maneuver selection: prefer braking, then lane change."""
@@ -683,7 +688,7 @@ def causal_ellipse_actor(
         
         # Select action based on intervention need
         accel_cmd, target_lateral_offset = jax.lax.cond(
-            intervention_needed,
+            can_start_reaction,
             select_evasive_maneuver,
             maintain_behavior
         )
@@ -733,7 +738,11 @@ def causal_ellipse_actor(
         actions = dynamics_model.inverse(traj_combined, state.object_metadata, timestep=0)
 
         # Update actor state
-        new_actor_state = {"lateral_offset": new_lateral_offset, "reaction_timer": jnp.array(0)}
+        new_actor_state = {**actor_state,
+            "lateral_offset": new_lateral_offset, 
+            "reaction_timer": reaction_timer,
+            "has_reacted": has_reacted
+            }
 
         return actor_core.WaymaxActorOutput(
             actor_state=new_actor_state,
