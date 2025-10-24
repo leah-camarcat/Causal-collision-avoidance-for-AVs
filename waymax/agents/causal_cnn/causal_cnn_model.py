@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ============================================================================
-# CAUSAL CONVOLUTIONAL LAYERS
+# OLD
 # ============================================================================
 
 class CausalConv2d(nn.Module):
@@ -125,10 +125,6 @@ class TemporalAttention(nn.Module):
 
         return attended, attn_weights
 
-
-# ============================================================================
-# MAIN CAUSAL RISK CNN
-# ============================================================================
 
 import jax
 import jax.numpy as jnp
@@ -269,6 +265,10 @@ class CausalRiskCNN_old(nn.Module):
 
         return risk_grid[0, grid_x, grid_y, 0]
 
+
+# ============================================================================
+# LATEST VERSION
+# ============================================================================
 
 class AgentEncoder(nn.Module):
     """Encode individual agent features."""
