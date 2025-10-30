@@ -132,7 +132,7 @@ from flax import linen as nn
 from typing import Tuple
 
 
-class CausalConv2D(nn.Module):
+class CausalConv2D_old(nn.Module):
     """2D convolution with causal padding (no future leakage)."""
     features: int
     kernel_size: Tuple[int, int]
@@ -146,7 +146,7 @@ class CausalConv2D(nn.Module):
         return nn.Conv(features=self.features, kernel_size=self.kernel_size)(x)
 
 
-class SpatialAttention(nn.Module):
+class SpatialAttention_old(nn.Module):
     """Attention mechanism for spatial risk regions."""
     @nn.compact
     def __call__(self, x):
@@ -157,7 +157,7 @@ class SpatialAttention(nn.Module):
         return attended, attn
 
 
-class TemporalAttention(nn.Module):
+class TemporalAttention_old(nn.Module):
     """Attention over observation history (causal)."""
     hidden_dim: int = 64
 
@@ -267,10 +267,10 @@ class CausalRiskCNN_old(nn.Module):
 
 
 # ============================================================================
-# LATEST VERSION
+# GRID VERSION
 # ============================================================================
 
-class AgentEncoder(nn.Module):
+class AgentEncoder_old(nn.Module):
     """Encode individual agent features."""
     hidden_dim: int = 32
     
@@ -283,7 +283,7 @@ class AgentEncoder(nn.Module):
         return x  # (batch, history, max_agents, hidden_dim)
 
 
-class AgentAttention(nn.Module):
+class AgentAttention_old(nn.Module):
     """Attention over agents (which agents matter most?)."""
     hidden_dim: int = 32
     
@@ -307,7 +307,7 @@ class AgentAttention(nn.Module):
         return attended, attn_weights
 
 
-class CausalRiskCNN(nn.Module):
+class CausalRiskCNN_old(nn.Module):
     grid_size: int = 64
     hidden_dims: Tuple[int, ...] = (64, 128, 256, 128, 64)
 
@@ -376,7 +376,136 @@ class CausalRiskCNN(nn.Module):
         risk_grid = nn.sigmoid(risk_grid)
         
         return risk_grid, attention_maps
+
+
+# ============================================================================
+# RISK ARRAY VERSION (OUTPUT: (32, ))
+# ============================================================================
+class AgentEncoder(nn.Module):
+    """Encode individual agent features."""
+    hidden_dim: int = 32
     
+    @nn.compact
+    def __call__(self, agent_features):
+        # agent_features: (batch, history, max_agents, 6)
+        x = nn.Dense(self.hidden_dim)(agent_features)
+        x = nn.relu(x)
+        x = nn.Dense(self.hidden_dim)(x)
+        return x  # (batch, history, max_agents, hidden_dim)
+
+
+class AgentAttention(nn.Module):
+    """Attention over agents (which agents matter most?)."""
+    hidden_dim: int = 32
+    
+    @nn.compact
+    def __call__(self, x):
+        # x: (batch, history, max_agents, features)
+        batch, history, agents, features = x.shape
+        
+        # Flatten history into batch for agent attention
+        x_flat = x.reshape(batch * history, agents, features)
+        
+        # Simple attention over agents
+        scores = nn.Dense(1)(x_flat)  # (batch*history, agents, 1)
+        attn_weights = nn.softmax(scores, axis=1)
+        
+        # Weighted sum over agents
+        attended = jnp.sum(x_flat * attn_weights, axis=1)  # (batch*history, features)
+        
+        # Reshape back
+        attended = attended.reshape(batch, history, features)
+        
+        return attended, attn_weights.reshape(batch, history, agents, 1)
+
+
+class TemporalAttention(nn.Module):
+    """Attention over time steps."""
+    hidden_dim: int = 64
+    
+    @nn.compact
+    def __call__(self, x):
+        # x: (batch, history, features)
+        # Compute attention scores for each time step
+        scores = nn.Dense(1)(x)  # (batch, history, 1)
+        attn_weights = nn.softmax(scores, axis=1)
+        
+        # Apply attention
+        attended = x * attn_weights
+        
+        return attended, attn_weights
+
+
+class CausalRiskCNN(nn.Module):
+    max_agents: int = 32
+    hidden_dims: Tuple[int, ...] = (64, 128, 256, 128, 64)
+    
+    @nn.compact
+    def __call__(self, observations, training: bool = False):
+        """
+        Args:
+            observations: (batch, history_length, max_agents, 6)
+        Returns:
+            agent_risks: (batch, max_agents) - risk value per agent
+            attention_maps: dict of attention weights
+        """
+        batch_size = observations.shape[0]
+        history_length = observations.shape[1]
+        num_agents = observations.shape[2]  # Should be max_agents (32)
+
+        # 1. Encode each agent
+        agent_encoded = AgentEncoder(hidden_dim=32)(observations)
+        # Shape: (batch, history, max_agents, 32)
+        
+        # 2. Per-agent temporal processing
+        # Reshape to process each agent's history independently
+        b, h, a, f = agent_encoded.shape
+        agent_temporal = agent_encoded.transpose(0, 2, 1, 3)  # (batch, max_agents, history, features)
+        agent_temporal = agent_temporal.reshape(b * a, h, f)
+        
+        # Apply temporal attention per agent
+        temporal_features, temporal_attn_flat = TemporalAttention(hidden_dim=64)(agent_temporal)
+        # Shape: (batch*max_agents, history, features)
+        temporal_attn = temporal_attn_flat.reshape(b, a, h, 1)
+
+        # Get current timestep features for each agent
+        current_agent_features = temporal_features[:, -1, :]  # (batch*max_agents, features)
+        current_agent_features = current_agent_features.reshape(b, a, f)  # (batch, max_agents, features)
+        
+        # 3. Cross-agent context (agents influence each other's risk)
+        # Compute global context via attention
+        agent_aggregated, agent_attn = AgentAttention(hidden_dim=32)(agent_encoded)
+        # Shape: (batch, history, 32)
+        
+        global_context = agent_aggregated[:, -1, :]  # (batch, 32)
+        global_context_expanded = jnp.expand_dims(global_context, axis=1)  # (batch, 1, 32)
+        global_context_expanded = jnp.tile(global_context_expanded, (1, a, 1))  # (batch, max_agents, 32)
+        
+        # 4. Combine per-agent features with global context
+        combined_features = jnp.concatenate([current_agent_features, global_context_expanded], axis=-1)
+        # Shape: (batch, max_agents, features+32)
+        
+        # 5. Deep feature processing per agent
+        x = combined_features
+        for i, dim in enumerate(self.hidden_dims):
+            x = nn.Dense(dim)(x)
+            x = nn.relu(x)
+            
+            if training and i < len(self.hidden_dims) - 1:
+                x = nn.Dropout(rate=0.1)(x, deterministic=not training)
+        
+        # 6. Final risk prediction per agent
+        agent_risks = nn.Dense(1)(x)  # (batch, max_agents, 1)
+        agent_risks = nn.sigmoid(agent_risks)
+        agent_risks = jnp.squeeze(agent_risks, axis=-1)  # (batch, max_agents)
+        
+        attention_maps = {
+            'temporal_attention': temporal_attn,
+            'agent_attention': agent_attn
+        }
+        
+        return agent_risks, attention_maps
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
