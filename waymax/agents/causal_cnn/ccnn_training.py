@@ -18,10 +18,13 @@ import dataclasses
 from itertools import islice
 import re
 import tensorflow as tf
-
+import traceback
+if not sys.warnoptions:
+    import warnings
+    warnings.simplefilter("ignore")
 from waymax.agents.causal_cnn.causal_cnn_model import CausalRiskCNN
 from waymax.agents.causal_cnn.ground_truth_mttc import (
-    create_mttc_risk_grid,
+    compute_mttc_vectorized_simple,
     extract_multi_agent_observations
 )
 from waymax import config as _config, dataloader
@@ -31,7 +34,7 @@ import wandb
 # TRAINING UTILITIES
 # ============================================================================
 
-def train_step(state, batch, model, rng):
+def train_step(state, batch, model, rng, valid_mask):
     """Single training step."""
     def loss_fn(params):
         dropout_rng = jax.random.fold_in(rng, state.step)
@@ -42,22 +45,19 @@ def train_step(state, batch, model, rng):
             rngs={'dropout': dropout_rng}
             )
         
-        # Binary cross-entropy loss
         #bce_loss = optax.sigmoid_binary_cross_entropy(predictions, batch['risk_labels'])
+        mask = valid_mask.astype(jnp.float32)
         mse_loss = jnp.mean((predictions - batch['risk_labels']) ** 2) 
-        # Spatial smoothness regularization
-        dx = predictions[:, 1:, :, :] - predictions[:, :-1, :, :]
-        dy = predictions[:, :, 1:, :] - predictions[:, :, :-1, :]
-        smoothness_loss = jnp.mean(dx**2) + jnp.mean(dy**2)
-        
-        total_loss = jnp.mean(mse_loss) + 0.01 * smoothness_loss
+        masked_mse_loss = mse_loss * mask
+    
+        total_loss = jnp.mean(mse_loss)
         
         return total_loss, {
-            'bce': jnp.mean(mse_loss),
-            'smoothness': smoothness_loss,
+            'mse': jnp.mean(mse_loss),
+            'masked_mse': jnp.mean(masked_mse_loss),
             'total': total_loss
         }
-    
+
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, metrics), grads = grad_fn(state.params)
 
@@ -72,11 +72,11 @@ def train_step(state, batch, model, rng):
 def train_causal_risk_cnn(
     tfrecord_pattern: str,
     filtered_scenarios_dir: str,
-    output_path: str = "./trained_risk_model.pkl",
+    output_path: str = "./trained_risk_model_v3.pkl",
     grid_size: int = 64,
     grid_range: float = 50.0,
     history_length: int = 10,
-    max_agents: int = 8,
+    max_agents: int = 32,
     max_num_objects: int = 32,
     epochs_per_scenario: int = 3,
     learning_rate: float = 1e-4,
@@ -243,8 +243,8 @@ def train_causal_risk_cnn(
                             )
                             
                             # Create ground truth risk grid using MTTC
-                            risk_labels = create_mttc_risk_grid(
-                                temp_state, ego_idx, t, grid_size, grid_range
+                            risk_labels, valid_mask = compute_mttc_vectorized_simple(
+                                temp_state, ego_idx, t, filtered_scenarios_dir, scenario_id
                             )
                         
                             # Prepare batch
@@ -256,12 +256,12 @@ def train_causal_risk_cnn(
                             # Training step
                             #train_state_obj, metrics = jit_train_step(train_state_obj, batch)
                             train_rng, step_rng = jax.random.split(train_rng)
-                            train_state_obj, metrics = train_step(train_state_obj, batch, model, step_rng)
+                            train_state_obj, metrics = train_step(train_state_obj, batch, model, step_rng, valid_mask)
                             all_losses.append(float(metrics['total']))
                             num_samples_this_scenario += 1
                         
                         # wandb logging
-                        run.log({"epoch":epoch, "bce_loss":metrics['bce'], "total_loss":metrics['total']})
+                        run.log({"epoch":epoch, "mse_loss":metrics['mse'], "masked_mse": metrics['masked_mse']})
                     scenario_count += 1
                     
                     # Update progress bar with scenario info
@@ -286,6 +286,7 @@ def train_causal_risk_cnn(
                 
                 except Exception as e:
                     tqdm.write(f"✗ Error in scenario {scenario_idx}: {e}")
+                    tqdm.write(traceback.format_exc())
                     continue
                 finally:
                     pbar.update(1)
@@ -395,7 +396,7 @@ def plot_training_curve(losses, save_path):
 
 if __name__ == "__main__":
     tfrecord_pattern = "data/motion_v_1_3_0/uncompressed/tf_example/training/training_tfexample.tfrecord-*"
-    filtered_scenarios_dir = "docs/filtered_data_CCNN"
+    filtered_scenarios_dir = "docs/filtered_data_CCNN/training/"
     run = wandb.init(
         entity="leah-camarcat",
         project="Waymax RL",
@@ -408,11 +409,11 @@ if __name__ == "__main__":
     trained_params = train_causal_risk_cnn(
         tfrecord_pattern=tfrecord_pattern,
         filtered_scenarios_dir=filtered_scenarios_dir,
-        output_path="waymax/agents/causal_cnn/trained_risk_model_v2.pkl",
+        output_path="waymax/agents/causal_cnn/trained_risk_model_v3.pkl",
         grid_size=64,
         grid_range=50.0,
         history_length=10,
-        max_agents=8,
+        max_agents=32,
         max_num_objects=32,
         epochs_per_scenario=4,
         learning_rate=1e-3,
